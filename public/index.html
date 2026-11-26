@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+<title>Qwen Git</title>
+</head>
+<body>
+<header>
+  <nav>
+    <button data-tab="chat" class="on">Chat</button>
+    <button data-tab="repos">Repos</button>
+  </nav>
+  <span id="net">...</span>
+</header>
+<main>
+  <section id="chat" class="tab on">
+    <div class="bar">
+      <select id="model"></select>
+      <select id="repo"><option value="">no repo</option></select>
+      <button id="attachBtn" type="button">Attach</button>
+      <button id="newChat" type="button">New</button>
+    </div>
+    <div id="chips"></div>
+    <div id="files" hidden></div>
+    <div id="msgs"></div>
+    <form id="composer">
+      <textarea id="input" rows="2" placeholder="Prompt"></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </section>
+
+  <section id="repos" class="tab">
+    <form id="cloneForm" class="row">
+      <input id="cloneUrl" placeholder="https://github.com/owner/repo.git" autocapitalize="off" autocomplete="off">
+      <input id="cloneName" placeholder="folder (optional)" autocapitalize="off" autocomplete="off">
+      <button type="submit">Clone</button>
+    </form>
+    <div id="repoList"></div>
+    <div id="repoPanel" hidden>
+      <h3 id="repoTitle"></h3>
+      <div class="row">
+        <button data-act="status" type="button">Status</button>
+        <button data-act="diff" type="button">Diff</button>
+        <button data-act="pull" type="button">Pull</button>
+        <button data-act="push" type="button">Push</button>
+      </div>
+      <form id="commitForm" class="row">
+        <input id="commitMsg" placeholder="commit message" autocomplete="off">
+        <button type="submit">Commit all</button>
+      </form>
+      <form id="branchForm" class="row">
+        <input id="branchName" placeholder="new branch name" autocapitalize="off" autocomplete="off">
+        <button type="submit">Create</button>
+      </form>
+    </div>
+    <pre id="out"></pre>
+  </section>
+</main>
+<div id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
