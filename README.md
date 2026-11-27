@@ -34,6 +34,13 @@ The Git tab works on the selected repo.
 - Project: on sends the repo file list and git status with every message, which helps with debugging a whole project.
 - When the model writes a file it labels it `File: path`, so Save to repo and Download pre-fill the right name.
 
+## Memory
+
+Lightweight and optional: a single small JSON file, `~/batacode-workspace/.batacode-memory.json` (max 50 notes, 300 characters each). Notes are sent to the model with every message.
+
+- `remember I prefer Python 3.11 and type hints` saves a note.
+- `memory` lists notes. `forget 2` removes note 2. `forget all` clears them.
+
 ## In the chat
 
 - Clone: type `clone https://github.com/owner/repo.git` (optional folder name after the URL). The repo is cloned and selected.

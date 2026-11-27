@@ -763,6 +763,30 @@ async function chatClone(shown, url, name) {
   store.set("hist", history);
 }
 
+// ---------- lightweight memory ----------
+let memNotes = [];
+async function loadMemory() {
+  try { memNotes = (await api("/api/memory")).notes; } catch (e) { /* ignore */ }
+}
+async function memoryCmd(shown, cmd, arg) {
+  history.push({ role: "user", content: shown, shown, local: true });
+  addMsg("user", shown);
+  let text;
+  try {
+    if (cmd === "remember" && arg) memNotes = (await api("/api/memory", { notes: memNotes.concat(arg) })).notes;
+    else if (cmd === "forget" && /^\d+$/.test(arg)) memNotes = (await api("/api/memory", { notes: memNotes.filter((_, i) => i !== Number(arg) - 1) })).notes;
+    else if (cmd === "forget" && arg.toLowerCase() === "all") memNotes = (await api("/api/memory", { notes: [] })).notes;
+    else if (cmd !== "memory") { toast("Use: remember <text> | forget <n|all> | memory"); history.pop(); drawHistory(); return; }
+    text = memNotes.length ? "Memory:\n" + memNotes.map((n, i) => (i + 1) + ". " + n).join("\n") : "Memory is empty.";
+  } catch (e) {
+    text = "Memory error: " + e.message;
+  }
+  addMsg("assistant", text, true);
+  history.push({ role: "assistant", content: text, local: true });
+  store.set("hist", history);
+}
+loadMemory();
+
 // ---------- chat ----------
 const SYSTEM = "You are a coding assistant running on the user's own server. Explain code and errors clearly, write functions and complete files, debug, refactor and optimise. Be concise. For every file you write, put a line \"File: path/to/file\" right before its fenced code block, give the complete file contents unless a snippet is asked for, and tag the block with its language. If you need a file you cannot see, ask for it.";
 let history = store.get("hist", []);
@@ -844,6 +868,8 @@ $("#composer").onsubmit = async (e) => {
   const prompt = $("#input").value.trim();
   const model = $("#model").value;
   if (!prompt) return;
+  const mm = prompt.match(/^\/?(remember|forget|memory)\b\s*(.*)$/i);
+  if (mm) { $("#input").value = ""; await memoryCmd(prompt, mm[1].toLowerCase(), mm[2].trim()); return; }
   const cm = prompt.match(/^\/?clone\s+(\S+)(?:\s+(\S+))?$/i);
   if (cm) { $("#input").value = ""; await chatClone(prompt, cm[1], cm[2] || ""); return; }
   if (!model) { toast("No model. Is the tunnel up?"); return; }
@@ -864,6 +890,7 @@ $("#composer").onsubmit = async (e) => {
   try {
     const messages = [{ role: "system", content: SYSTEM }];
     const pc = await projectContext();
+    if (memNotes.length) messages.push({ role: "system", content: "Things to remember about the user and their projects:\n- " + memNotes.join("\n- ") });
     if (pc) messages.push({ role: "system", content: pc });
     history.filter((m) => !m.local).forEach((m) => messages.push({ role: m.role, content: m.content }));
     const r = await fetch("/api/chat", {

@@ -105,7 +105,37 @@ def safe_join(root, rel, allow_root=False):
     return p
 
 
+
+# ---------- lightweight memory (one small JSON file) ----------
+MEMORY_FILE = WORKSPACE / ".batacode-memory.json"
+MEM_MAX_NOTES = 50
+MEM_NOTE_MAX = 300
+
+
+def load_memory():
+    try:
+        notes = json.loads(MEMORY_FILE.read_text()).get("notes", [])
+        return [str(n) for n in notes][-MEM_MAX_NOTES:]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 # ---------- routes ----------
+
+def r_memory_get(h, q):
+    h.send_json(200, {"notes": load_memory()})
+
+
+def r_memory_post(h, q):
+    d = h.read_json()
+    notes = d.get("notes")
+    if not isinstance(notes, list):
+        raise ApiError(400, "notes list required")
+    clean = [str(n).strip()[:MEM_NOTE_MAX] for n in notes if str(n).strip()][-MEM_MAX_NOTES:]
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    MEMORY_FILE.write_text(json.dumps({"notes": clean}, indent=1))
+    h.send_json(200, {"notes": clean})
+
 
 def r_tags(h, q):
     proxy(h, "GET", "/api/tags", None)
@@ -726,6 +756,8 @@ def r_switch(h, q):
 
 
 ROUTES = {
+    ("GET", "/api/memory"): r_memory_get,
+    ("POST", "/api/memory"): r_memory_post,
     ("GET", "/api/tags"): r_tags,
     ("POST", "/api/chat"): r_chat,
     ("GET", "/api/repos"): r_repos,
