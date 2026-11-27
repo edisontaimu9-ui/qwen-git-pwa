@@ -39,6 +39,7 @@ function showTab(id) {
   if (id === "git") gRefresh();
   if (id === "auto") autoRefresh();
   if (id === "patch") patchRefresh();
+  if (id === "term") termRefresh();
 }
 document.querySelectorAll("nav button").forEach((b) => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -118,6 +119,7 @@ function selectRepo(name) {
   $("#gView").textContent = "";
   if ($("#git").classList.contains("on")) gRefresh();
   if ($("#patch").classList.contains("on")) patchRefresh();
+  tFillCwd();
 }
 $("#repo").onchange = () => selectRepo($("#repo").value);
 
@@ -1477,6 +1479,230 @@ $("#pAll").onclick = () => { pUnchecked.clear(); patchRefresh(); };
 $("#pNone").onclick = () => { pFiles.forEach((c) => pUnchecked.add(c.path)); patchRefresh(); };
 $("#pZip").onclick = () => patchGenerate(true);
 $("#pCmds").onclick = () => patchGenerate(false);
+
+// ---------- terminal and server management ----------
+// Read-only commands run at once. Anything else asks you first, and the server refuses it
+// unless the request says it was approved. A few destructive commands are always refused.
+const QUICK = ["git status", "git log --oneline -10", "ls -la", "df -h", "free -m", "uptime", "ps",
+  "python3 -m unittest discover -s tests", "pip list", "python3 --version"];
+let tHist = store.get("tHist", []);
+let tBusy = false;
+
+function fmtBytes(n) {
+  if (n === null || n === undefined) return "?";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1)) + " " + u[i];
+}
+function fmtUp(sec) {
+  if (sec === null || sec === undefined) return "?";
+  const d = Math.floor(sec / 86400), hh = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  return d ? d + " d " + hh + " h" : hh ? hh + " h " + m + " min" : m + " min";
+}
+
+function tPrint(text, cls) {
+  const out = $("#tOut");
+  const sp = document.createElement("span");
+  if (cls) sp.className = cls;
+  sp.textContent = text;
+  out.append(sp);
+  while (out.childNodes.length > 400) out.removeChild(out.firstChild);
+  out.scrollTop = out.scrollHeight;
+}
+
+function tStatusLine(el, state, label, note) {
+  el.textContent = "";
+  const dot = document.createElement("span");
+  dot.className = "dot " + state;
+  dot.textContent = "●";
+  el.append(dot, document.createTextNode(label));
+  if (note) {
+    const sm = document.createElement("small");
+    sm.textContent = note;
+    el.append(sm);
+  }
+}
+
+async function tFill() {
+  const sel = $("#tQuick");
+  sel.textContent = "";
+  sel.add(new Option("Quick and recent...", ""));
+  const g1 = document.createElement("optgroup");
+  g1.label = "Quick";
+  QUICK.forEach((c) => g1.append(new Option(c, c)));
+  sel.append(g1);
+  if (tHist.length) {
+    const g2 = document.createElement("optgroup");
+    g2.label = "Recent";
+    tHist.forEach((c) => g2.append(new Option(c, c)));
+    sel.append(g2);
+  }
+  sel.value = "";
+}
+$("#tQuick").onchange = () => {
+  const v = $("#tQuick").value;
+  if (v) { $("#tCmd").value = v; $("#tCmd").focus(); }
+  $("#tQuick").value = "";
+};
+
+function tFillCwd() {
+  const sel = $("#tCwd");
+  const keep = sel.value;
+  sel.textContent = "";
+  sel.add(new Option("in: workspace", ""));
+  if (currentRepo) sel.add(new Option("in: " + currentRepo, currentRepo));
+  sel.value = Array.from(sel.options).some((o) => o.value === keep) && keep ? keep : (currentRepo || "");
+}
+
+function tRemember(cmd) {
+  tHist = [cmd].concat(tHist.filter((c) => c !== cmd)).slice(0, 15);
+  store.set("tHist", tHist);
+  tFill();
+}
+
+async function tExec(cmd, approved, quiet) {
+  const cwd = $("#tCwd").value;
+  if (!quiet) tPrint("$ " + cmd + "   [" + (cwd || "workspace") + "]\n", "t-cmd");
+  const r = await fetch("/api/exec", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-PWA": "1" },
+    body: JSON.stringify({ cmd, cwd, approved: !!approved }),
+  });
+  let j;
+  try { j = await r.json(); } catch (e) { j = { error: "bad response" }; }
+  if (r.status === 409 && j.needs_approval) {
+    const ok = window.confirm("Run this command?\n\n$ " + cmd + "\n\nin: " + (cwd || "workspace") +
+      "\nWhy it needs approval: " + j.reason + "\n\nIt runs on this phone with your permissions.");
+    if (!ok) { tPrint("(not run)\n\n", "t-note"); return; }
+    return tExec(cmd, true, true);
+  }
+  if (!r.ok) { tPrint("error: " + (j.error || r.statusText) + "\n\n", "t-bad"); return; }
+  const text = j.output || "";
+  tPrint(text ? (text.endsWith("\n") ? text : text + "\n") : "(no output)\n");
+  tPrint("exit " + j.code + (j.timed_out ? " (timed out)" : "") + (j.truncated ? " (output cut)" : "") + "  " + j.seconds + " s\n\n",
+    j.ok ? "t-ok" : "t-bad");
+}
+
+$("#tForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const cmd = $("#tCmd").value.trim();
+  if (!cmd || tBusy) return;
+  tBusy = true;
+  $("#tCmd").value = "";
+  tRemember(cmd);
+  try { await tExec(cmd, false, false); } catch (err) { tPrint("error: " + err.message + "\n\n", "t-bad"); }
+  tBusy = false;
+};
+$("#tClear").onclick = () => { $("#tOut").textContent = ""; };
+
+$("#tTests").onclick = async () => {
+  if (!currentRepo) { toast("Pick a repo in the Repos tab first"); return; }
+  if (tBusy) return;
+  if (!window.confirm("Run the tests of " + currentRepo + "? This executes the project's code on this phone.")) return;
+  tBusy = true;
+  tPrint("$ run tests   [" + currentRepo + "]\n", "t-cmd");
+  try {
+    const j = await api("/api/check", { repo: currentRepo, run_tests: true });
+    tPrint(checkSummary(j) + "\n");
+    if (j.tests.ran) {
+      tPrint((j.tests.output || "(no output)").replace(/\n?$/, "\n"));
+      tPrint((j.tests.ok ? "PASSED" : "FAILED") + "  " + j.tests.seconds + " s\n\n", j.tests.ok ? "t-ok" : "t-bad");
+    } else {
+      tPrint("\n");
+    }
+  } catch (err) { tPrint("error: " + err.message + "\n\n", "t-bad"); }
+  tBusy = false;
+};
+
+async function termOllama() {
+  const el = $("#tOllama");
+  try {
+    const j = await api("/api/ollama_status");
+    if (!j.up) { tStatusLine(el, "bad", "Ollama down", j.error + "\nStart the tunnel below, or check that Ollama is running on the server."); return; }
+    const loaded = j.running.length
+      ? "loaded: " + j.running.map((m) => m.name + " (" + fmtBytes(m.size_vram || m.size) + (m.size_vram ? " VRAM" : "") + ")").join(", ")
+      : "no model loaded in memory";
+    tStatusLine(el, "ok", "Ollama up, " + j.latency_ms + " ms" + (j.version ? ", v" + j.version : "") + ", " + j.models.length + " model" + (j.models.length === 1 ? "" : "s"), loaded);
+  } catch (e) { tStatusLine(el, "bad", "Ollama status failed", e.message); }
+}
+
+async function termTunnel() {
+  const el = $("#tTunnel");
+  try {
+    const j = await api("/api/tunnel");
+    if (!j.local) { tStatusLine(el, "warn", "No tunnel in use", "OLLAMA_URL points to another machine."); return; }
+    if (j.listening && j.pids.length) {
+      tStatusLine(el, "ok", "Tunnel up, port " + j.port + ", ssh pid " + j.pids.join(", "), "to " + j.host);
+    } else if (j.listening) {
+      tStatusLine(el, "warn", "Port " + j.port + " is open but no ssh tunnel process was found", "Something else may be forwarding it. Restart replaces only our own ssh.");
+    } else if (j.pids.length) {
+      tStatusLine(el, "warn", "ssh is running but port " + j.port + " is closed", "Try Restart.\n" + j.log);
+    } else {
+      tStatusLine(el, "bad", "Tunnel down", (j.key_found ? "Press Start tunnel (to " + j.host + ")." : "SSH key not found. Set PWA_SSH_KEY.") + (j.log ? "\n" + j.log : ""));
+    }
+  } catch (e) { tStatusLine(el, "bad", "Tunnel status failed", e.message); }
+}
+
+async function termPhone() {
+  const el = $("#tPhone");
+  try {
+    const j = await api("/api/sysinfo");
+    const parts = [];
+    parts.push(j.load ? "load " + j.load.join(" ") + " (" + j.cpus + " cpus)" : j.cpus + " cpus");
+    if (j.mem_total) parts.push("memory " + fmtBytes(j.mem_available) + " free of " + fmtBytes(j.mem_total));
+    if (j.disk) parts.push("disk " + fmtBytes(j.disk.free) + " free of " + fmtBytes(j.disk.total));
+    parts.push("up " + fmtUp(j.uptime));
+    tStatusLine(el, "ok", "This phone", parts.join("\n") + "\nPython " + j.python + ", app pid " + j.pid);
+  } catch (e) { tStatusLine(el, "warn", "Resources unavailable", e.message); }
+}
+
+function termStatus() { termOllama(); termTunnel(); termPhone(); }
+
+function termRefresh() {
+  tFill();
+  tFillCwd();
+  termStatus();
+}
+$("#tStatRefresh").onclick = termStatus;
+setInterval(() => {
+  if ($("#term").classList.contains("on") && $("#tStat").open && !document.hidden) { termOllama(); termTunnel(); }
+}, 10000);
+
+async function tunnelAct(action) {
+  const names = { start: "Start the SSH tunnel to the server?", stop: "Stop the SSH tunnel? Chat will not reach Ollama until it is started again.",
+    restart: "Restart the SSH tunnel?" };
+  if (!window.confirm(names[action])) return;
+  const btns = ["#tTunStart", "#tTunStop", "#tTunRestart"].map((x) => $(x));
+  btns.forEach((b) => { b.disabled = true; });
+  tPrint("tunnel " + action + "...\n", "t-note");
+  try {
+    const j = await api("/api/tunnel", { action });
+    tPrint(j.message + "\n\n", "t-ok");
+    toast(j.message);
+  } catch (e) {
+    tPrint("tunnel error: " + e.message + "\n\n", "t-bad");
+    toast(e.message);
+  }
+  btns.forEach((b) => { b.disabled = false; });
+  termTunnel();
+  termOllama();
+  loadModels();
+}
+$("#tTunStart").onclick = () => tunnelAct("start");
+$("#tTunStop").onclick = () => tunnelAct("stop");
+$("#tTunRestart").onclick = () => tunnelAct("restart");
+
+$("#tSrvBtn").onclick = async () => {
+  const pre = $("#tSrv");
+  pre.hidden = false;
+  pre.textContent = "asking the server over SSH...";
+  $("#tSrvBtn").disabled = true;
+  try {
+    const j = await api("/api/server_info");
+    pre.textContent = (j.ok ? "" : "FAILED\n") + j.host + "\n\n" + (j.output || "(no output)");
+  } catch (e) { pre.textContent = e.message; }
+  $("#tSrvBtn").disabled = false;
+};
 
 // ---------- start ----------
 drawHistory();

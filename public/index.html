@@ -19,6 +19,7 @@
     <button data-tab="git">Git</button>
     <button data-tab="auto">Auto</button>
     <button data-tab="patch">Patch</button>
+    <button data-tab="term">Term</button>
   </nav>
   <span id="net">...</span>
 </header>
@@ -221,6 +222,36 @@
     </div>
     <div id="pOut"></div>
   </section>
+  <section id="term" class="tab">
+    <details id="tStat" open>
+      <summary class="muted">Status: Ollama, tunnel, resources</summary>
+      <div id="tOllama" class="stat"></div>
+      <div id="tTunnel" class="stat"></div>
+      <div class="row">
+        <button id="tTunStart" type="button">Start tunnel</button>
+        <button id="tTunStop" type="button">Stop</button>
+        <button id="tTunRestart" type="button">Restart</button>
+        <button id="tStatRefresh" type="button">Refresh</button>
+      </div>
+      <div id="tPhone" class="stat"></div>
+      <div class="row">
+        <button id="tSrvBtn" type="button">Inspect server (SSH)</button>
+      </div>
+      <pre id="tSrv" hidden></pre>
+    </details>
+    <div class="row">
+      <select id="tCwd" title="Folder the command runs in"></select>
+      <select id="tQuick" title="Quick and recent commands"></select>
+      <button id="tTests" type="button">Run tests</button>
+      <button id="tClear" type="button">Clear</button>
+    </div>
+    <pre id="tOut"></pre>
+    <form id="tForm" class="row">
+      <input id="tCmd" placeholder="command, for example: git status" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
+      <button type="submit">Run</button>
+    </form>
+  </section>
+
 </main>
 <div id="toast" hidden></div>
 <script src="app.js"></script>

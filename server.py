@@ -13,8 +13,11 @@ import mimetypes
 import os
 import re
 import shlex
+import signal
+import socket
 import subprocess
 import sys
+import threading
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1597,6 +1600,439 @@ def r_patch_zip(h, q):
 
 
 
+# ---------- terminal and server management ----------
+SSH_HOST = os.environ.get("PWA_SSH_HOST", "ubuntu@41.75.113.54")
+SSH_KEY = os.environ.get("PWA_SSH_KEY", str(Path.home() / ".ssh" / "server_ssh_key"))
+TUNNEL_PORT = OLLAMA.port or 11434
+TUNNEL_LOG = WORKSPACE / ".batacode-tunnel.log"
+EXEC_MAX_SECONDS = 300
+EXEC_MAX_BYTES = 1_000_000          # stop a command that prints more than this
+EXEC_SLOTS = threading.Semaphore(2)  # at most two commands at once
+_tunnel_proc = None                  # the ssh we started ourselves (kept so it can be reaped)
+
+# Commands that only read and run with no approval. They run without a shell, so ; | > $() do nothing.
+SAFE_COMMANDS = {
+    "pwd", "ls", "df", "du", "free", "uptime", "ps", "date", "uname", "whoami", "id", "hostname",
+    "wc", "head", "tail", "cat", "grep", "which", "echo", "tree", "nproc", "stat", "file",
+}
+SAFE_GIT = {"status", "log", "diff", "branch", "show", "remote", "stash", "blame", "shortlog", "describe"}
+SHELL_META = re.compile(r"[;&|<>`$\n\\()*?{}]")
+# Refused even when approved: they cannot be undone and are almost never what you want.
+BLOCKED = [
+    (re.compile(r"\bmkfs(\.\w+)?\b"), "formatting a disk"),
+    (re.compile(r"\bdd\b[^;&|]*\bof=/dev/"), "writing straight to a device"),
+    (re.compile(r">\s*/dev/(sd|mmcblk|nvme|block)"), "writing straight to a device"),
+    (re.compile(r":\s*\(\s*\)\s*\{"), "a fork bomb"),
+    (re.compile(r"(^|[;&|]\s*)(sudo\s+)?(shutdown|reboot|poweroff|halt)\b"), "shutting the machine down"),
+    (re.compile(r"\bchmod\s+-R\s+\d+\s+/(\s|$)"), "changing permissions on /"),
+]
+WIPE_TARGETS = {"/", "/*", "~", "~/", "~/*", "$HOME", "$HOME/", "$HOME/*", "${HOME}", "${HOME}/", "${HOME}/*", ".."}
+
+
+def wipes_everything(cmd):
+    """True if any part of the command line is a recursive rm of /, the home folder or the parent folder."""
+    for seg in re.split(r"[;&|\n]+", cmd):
+        try:
+            argv = shlex.split(seg)
+        except ValueError:
+            continue
+        for i, a in enumerate(argv[:4]):
+            if os.path.basename(a) != "rm":
+                continue
+            rest = argv[i + 1:]
+            recursive = any(x in ("--recursive",) or (x.startswith("-") and not x.startswith("--") and ("r" in x or "R" in x))
+                            for x in rest)
+            if recursive and any(x in WIPE_TARGETS for x in rest):
+                return True
+    return False
+
+
+def classify_command(cmd):
+    """('blocked', why) | ('approve', why) | ('safe', '') for one command line."""
+    cmd = cmd.strip()
+    if not cmd:
+        return "approve", "empty"
+    for rx, why in BLOCKED:
+        if rx.search(cmd):
+            return "blocked", why
+    if wipes_everything(cmd):
+        return "blocked", "deleting /, your home folder or the parent folder"
+    if SHELL_META.search(cmd):
+        return "approve", "uses shell features"
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return "approve", "unbalanced quotes"
+    if not argv:
+        return "approve", "empty"
+    if any(a.startswith("~") for a in argv):
+        return "approve", "uses ~ (needs a shell)"
+    head = argv[0]
+    if head == "git":
+        rest = [a for a in argv[1:] if not a.startswith("-")]
+        if rest and rest[0] in SAFE_GIT and not any(a.startswith(("--ext-diff", "--output", "-c", "--exec")) for a in argv[1:]):
+            if rest[0] == "branch" and any(a in argv for a in ("-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move")):
+                return "approve", "changes branches"
+            if rest[0] in ("remote", "stash") and len(rest) > 1 and rest[1] not in ("-v", "show", "list", "get-url"):
+                return "approve", "changes git state"
+            return "safe", ""
+        return "approve", "git command that may change things"
+    if head in SAFE_COMMANDS:
+        return "safe", ""
+    if head in ("python3", "python", "node", "pip", "pip3", "npm") and argv[1:] in (["--version"], ["-V"], ["list"], ["-v"]):
+        return "safe", ""
+    return "approve", "not on the read-only list"
+
+
+def exec_env():
+    return dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_PAGER="cat", PAGER="cat", TERM="dumb",
+                PYTHONDONTWRITEBYTECODE="1")
+
+
+def kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_command(cmd, cwd, use_shell, timeout):
+    """Run one command; returns {code, output, seconds, timed_out, truncated}. Output is capped."""
+    shell = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    args = [shell, "-c", cmd] if use_shell else shlex.split(cmd)
+    t0 = time.time()
+    try:
+        proc = subprocess.Popen(args, cwd=str(cwd), env=exec_env(), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    except FileNotFoundError:
+        return {"code": 127, "output": "command not found: %s" % args[0], "seconds": 0.0,
+                "timed_out": False, "truncated": False}
+    except OSError as e:
+        return {"code": 126, "output": "could not run: %s" % e, "seconds": 0.0, "timed_out": False, "truncated": False}
+    buf = bytearray()
+    state = {"cut": False}
+
+    def pump():
+        while True:
+            chunk = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > EXEC_MAX_BYTES:
+                state["cut"] = True
+                kill_group(proc)
+                break
+
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_group(proc)
+        proc.wait()
+    th.join(2)
+    try:
+        proc.stdout.close()
+    except OSError:
+        pass
+    text = bytes(buf).decode("utf-8", "replace")
+    truncated = state["cut"] or len(text) > MAX_OUT
+    if len(text) > MAX_OUT:
+        text = "[earlier output cut]\n" + text[-MAX_OUT:]
+    return {"code": proc.returncode, "output": text, "seconds": round(time.time() - t0, 1),
+            "timed_out": timed_out, "truncated": truncated}
+
+
+def r_exec(h, q):
+    """POST {cmd, cwd?, approved?, timeout?}. Read-only commands run at once, anything else needs approved=true."""
+    d = h.read_json()
+    cmd = d.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > 4000 or "\x00" in cmd:
+        raise ApiError(400, "cmd required (max 4000 characters)")
+    cmd = cmd.strip()
+    cwd_name = d.get("cwd") or ""
+    cwd = repo_path(cwd_name) if cwd_name else WORKSPACE
+    kind, why = classify_command(cmd)
+    if kind == "blocked":
+        raise ApiError(403, "blocked, this looks like %s" % why)
+    if kind == "approve" and d.get("approved") is not True:
+        h.send_json(409, {"needs_approval": True, "reason": why, "cmd": cmd})
+        return
+    try:
+        timeout = max(1, min(EXEC_MAX_SECONDS, int(d.get("timeout") or 60)))
+    except (TypeError, ValueError):
+        timeout = 60
+    if not EXEC_SLOTS.acquire(blocking=False):
+        raise ApiError(429, "two commands are already running, wait for one to finish")
+    try:
+        res = run_command(cmd, cwd, kind == "approve", timeout)
+    finally:
+        EXEC_SLOTS.release()
+    res.update({"ok": res["code"] == 0, "cmd": cmd, "cwd": cwd_name or ".", "approved": kind == "approve"})
+    h.send_json(200, res)
+
+
+# --- this device ---
+
+def read_meminfo():
+    info = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            m = re.match(r"\s*(\d+)", v)
+            if m:
+                info[k] = int(m.group(1)) * 1024
+    except OSError:
+        pass
+    return info
+
+
+def r_sysinfo(h, q):
+    """GET: CPU load, memory, disk, uptime of the device running this app."""
+    mem = read_meminfo()
+    total = mem.get("MemTotal")
+    avail = mem.get("MemAvailable", mem.get("MemFree"))
+    try:
+        load = [round(x, 2) for x in os.getloadavg()]
+    except (OSError, AttributeError):
+        load = None
+    try:
+        up = float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        up = None
+    try:
+        du = shutil.disk_usage(str(WORKSPACE))
+        disk = {"total": du.total, "used": du.used, "free": du.free}
+    except OSError:
+        disk = None
+    h.send_json(200, {
+        "cpus": os.cpu_count(), "load": load, "uptime": up,
+        "mem_total": total, "mem_available": avail,
+        "swap_total": mem.get("SwapTotal"), "swap_free": mem.get("SwapFree"),
+        "disk": disk, "workspace": str(WORKSPACE), "python": sys.version.split()[0],
+        "pid": os.getpid(), "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+# --- Ollama ---
+
+def ollama_get(path, timeout=3):
+    conn = http.client.HTTPConnection(OLLAMA.hostname, OLLAMA.port or 11434, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read(2_000_000)
+        if resp.status != 200:
+            raise OSError("HTTP %d" % resp.status)
+        return json.loads(body)
+    finally:
+        conn.close()
+
+
+def r_ollama_status(h, q):
+    """GET: is Ollama reachable, how fast, which models exist and which are loaded in memory."""
+    res = {"url": OLLAMA.geturl(), "up": False, "latency_ms": None, "version": "", "models": [], "running": [], "error": ""}
+    t0 = time.time()
+    try:
+        tags = ollama_get("/api/tags")
+        res["up"] = True
+        res["latency_ms"] = int((time.time() - t0) * 1000)
+        res["models"] = [{"name": m.get("name", ""), "size": m.get("size", 0)} for m in tags.get("models", [])]
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        res["error"] = "%s: %s" % (type(e).__name__, e) if str(e) else type(e).__name__
+        h.send_json(200, res)
+        return
+    for key, path in (("version", "/api/version"), ("running", "/api/ps")):
+        try:
+            j = ollama_get(path)
+            if key == "version":
+                res["version"] = str(j.get("version", ""))
+            else:
+                res["running"] = [{"name": m.get("name", ""), "size": m.get("size", 0),
+                                   "size_vram": m.get("size_vram", 0), "expires_at": m.get("expires_at", "")}
+                                  for m in j.get("models", [])]
+        except (OSError, ValueError, http.client.HTTPException):
+            pass  # older Ollama versions have no /api/ps
+    h.send_json(200, res)
+
+
+# --- the server behind the SSH tunnel ---
+
+REMOTE_STATS = (
+    "uptime; echo; free -m; echo; df -h / 2>/dev/null; echo; "
+    "(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu "
+    "--format=csv,noheader 2>/dev/null || echo 'no GPU info (nvidia-smi not found)'); echo; "
+    "ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -6"
+)
+
+
+def ssh_base():
+    return ["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
+
+
+def run_ssh(remote_cmd, timeout=25):
+    """Run a fixed command on the server over SSH. Returns (ok, text)."""
+    if not Path(SSH_KEY).is_file():
+        return False, "SSH key not found: %s (set PWA_SSH_KEY)" % SSH_KEY
+    try:
+        p = subprocess.run(ssh_base() + [SSH_HOST, remote_cmd], capture_output=True, text=True,
+                           errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return False, "SSH timed out after %d s" % timeout
+    except FileNotFoundError:
+        return False, "ssh is not installed (pkg install openssh)"
+    return p.returncode == 0, (p.stdout + p.stderr)[:MAX_OUT]
+
+
+def r_server_info(h, q):
+    """GET: CPU, memory, disk, GPU and top processes on the server (a fixed read-only command over SSH)."""
+    ok, text = run_ssh(REMOTE_STATS)
+    h.send_json(200, {"ok": ok, "host": SSH_HOST, "output": text})
+
+
+# --- SSH tunnel to Ollama ---
+
+def tunnel_pids(port, proc_dir="/proc"):
+    """PIDs of ssh processes that forward local `port` (found from their command lines)."""
+    pids = []
+    try:
+        entries = os.listdir(proc_dir)
+    except OSError:
+        return pids
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            raw = Path(proc_dir, name, "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        if not argv or os.path.basename(argv[0]) != "ssh":
+            continue
+        for i, a in enumerate(argv):
+            spec = argv[i + 1] if a == "-L" and i + 1 < len(argv) else (a[2:] if a.startswith("-L") and len(a) > 2 else "")
+            if spec.startswith("%d:" % port) or spec.startswith("localhost:%d:" % port) or spec.startswith("127.0.0.1:%d:" % port):
+                pids.append(int(name))
+                break
+    return sorted(pids)
+
+
+def port_listening(port, host="127.0.0.1"):
+    try:
+        with socket.create_connection((host, port), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+def tunnel_status():
+    global _tunnel_proc
+    if _tunnel_proc is not None and _tunnel_proc.poll() is not None:
+        _tunnel_proc = None  # reaped
+    local = OLLAMA.hostname in ("localhost", "127.0.0.1", "::1")
+    log = ""
+    try:
+        log = "\n".join(TUNNEL_LOG.read_text(errors="replace").strip().splitlines()[-6:])
+    except OSError:
+        pass
+    return {
+        "port": TUNNEL_PORT, "local": local, "listening": port_listening(TUNNEL_PORT) if local else None,
+        "pids": tunnel_pids(TUNNEL_PORT), "host": SSH_HOST, "key_found": Path(SSH_KEY).is_file(),
+        "started_here": _tunnel_proc is not None, "log": log,
+    }
+
+
+def tunnel_start():
+    global _tunnel_proc
+    st = tunnel_status()
+    if not st["local"]:
+        raise ApiError(400, "OLLAMA_URL is not local, so no tunnel is needed")
+    if st["listening"]:
+        return "Port %d is already in use (tunnel looks up). Use Restart to replace it." % TUNNEL_PORT
+    if not st["key_found"]:
+        raise ApiError(400, "SSH key not found: %s (set PWA_SSH_KEY)" % SSH_KEY)
+    if shutil.which("ssh") is None:
+        raise ApiError(400, "ssh is not installed (pkg install openssh)")
+    args = ssh_base() + ["-N", "-o", "ExitOnForwardFailure=yes", "-L", "%d:localhost:%d" % (TUNNEL_PORT, 11434), SSH_HOST]
+    try:
+        TUNNEL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        logf = open(TUNNEL_LOG, "w")
+    except OSError:
+        logf = subprocess.DEVNULL
+    try:
+        _tunnel_proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                                        start_new_session=True)
+    finally:
+        if logf is not subprocess.DEVNULL:
+            logf.close()
+    for _ in range(40):  # wait up to ~10 s for the forward to come up
+        time.sleep(0.25)
+        if _tunnel_proc.poll() is not None:
+            break
+        if port_listening(TUNNEL_PORT):
+            return "Tunnel started on port %d." % TUNNEL_PORT
+    if _tunnel_proc.poll() is not None:
+        _tunnel_proc = None
+        err = ""
+        try:
+            err = TUNNEL_LOG.read_text(errors="replace").strip()[-400:]
+        except OSError:
+            pass
+        raise ApiError(502, "ssh exited. " + (err or "No error text. Check the key and the server address."))
+    return "ssh is running but port %d is not open yet. Check the status again in a few seconds." % TUNNEL_PORT
+
+
+def tunnel_stop():
+    global _tunnel_proc
+    pids = tunnel_pids(TUNNEL_PORT)
+    if _tunnel_proc is not None and _tunnel_proc.pid not in pids and _tunnel_proc.poll() is None:
+        pids.append(_tunnel_proc.pid)
+    if not pids:
+        return "No tunnel process found."
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    for _ in range(20):
+        time.sleep(0.2)
+        if not tunnel_pids(TUNNEL_PORT):
+            break
+    if _tunnel_proc is not None:
+        try:
+            _tunnel_proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        _tunnel_proc = None
+    return "Stopped %d tunnel process%s." % (len(pids), "" if len(pids) == 1 else "es")
+
+
+def r_tunnel_get(h, q):
+    h.send_json(200, tunnel_status())
+
+
+def r_tunnel_post(h, q):
+    d = h.read_json()
+    act = d.get("action")
+    if act not in ("start", "stop", "restart"):
+        raise ApiError(400, "action must be start, stop or restart")
+    if act == "stop":
+        msg = tunnel_stop()
+    elif act == "start":
+        msg = tunnel_start()
+    else:
+        stopped = tunnel_stop()
+        msg = stopped + " " + tunnel_start()
+    h.send_json(200, {"message": msg, "status": tunnel_status()})
+
+
+
 ROUTES = {
     ("GET", "/api/memory"): r_memory_get,
     ("POST", "/api/memory"): r_memory_post,
@@ -1636,6 +2072,12 @@ ROUTES = {
     ("GET", "/api/deps"): r_deps,
     ("POST", "/api/patch_plan"): r_patch_plan,
     ("POST", "/api/patch_zip"): r_patch_zip,
+    ("POST", "/api/exec"): r_exec,
+    ("GET", "/api/sysinfo"): r_sysinfo,
+    ("GET", "/api/ollama_status"): r_ollama_status,
+    ("GET", "/api/server_info"): r_server_info,
+    ("GET", "/api/tunnel"): r_tunnel_get,
+    ("POST", "/api/tunnel"): r_tunnel_post,
 }
 
 

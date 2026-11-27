@@ -92,3 +92,14 @@ header { flex-wrap: wrap; gap: 4px; }
 .chg .cnt { font: 12px ui-monospace, monospace; flex: 0 0 auto; white-space: nowrap; }
 .cnt .a { color: #6bd68a; } .cnt .d { color: #ff7a7a; }
 details summary { cursor: pointer; }
+#term { overflow-y: auto; }
+#term .stat { font-size: 13px; padding: 4px 0; word-break: break-word; }
+#term .stat small { display: block; color: #8b93a7; white-space: pre-wrap; }
+.dot { font-size: 11px; margin-right: 4px; }
+.dot.ok { color: #6bd68a; } .dot.bad { color: #ff7a7a; } .dot.warn { color: #e5c07b; }
+#tSrv { margin: 6px 0 0; padding: 8px; background: #0a0c11; border-radius: 8px; font-size: 11px; white-space: pre; overflow: auto; max-height: 40vh; }
+#tOut { flex: 1 0 220px; margin: 0; padding: 8px; overflow: auto; background: #0a0c11; border-radius: 8px; font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
+#tOut .t-cmd { color: #7fb2ff; } #tOut .t-ok { color: #6bd68a; } #tOut .t-bad { color: #ff7a7a; } #tOut .t-note { color: #8b93a7; }
+#tForm { padding-bottom: env(safe-area-inset-bottom); }
+#tForm input { font-family: ui-monospace, monospace; }
+#term .row select { flex: 1; min-width: 0; }

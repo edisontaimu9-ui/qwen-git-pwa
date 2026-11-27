@@ -56,6 +56,20 @@ Under "Where the files are installed" you can set the repo folder and the downlo
 
 Commands only shows the commands without downloading. You can also use the Patch tab without Qwen: edit files yourself, then review and zip them.
 
+## Terminal and server management (Term tab)
+
+A mobile terminal plus a status panel for the machine and the server behind it.
+
+- Commands: type a command and press Run. It runs in the workspace or in the selected repo, and the output (stdout and stderr together) and exit code appear below. Quick and recent commands are in the menu. There is no interactive input (no vim, no password prompts), and a command is stopped after 60 s (300 s at most) or about 1 MB of output.
+- Approval: read-only commands (`ls`, `cat`, `grep`, `ps`, `df`, `free`, `git status`, `git log`, `git diff` and similar) run straight away, with no shell, so `;` `|` `>` and `$()` do nothing in them. Everything else (installs, `git push`, scripts, anything with shell features) shows a confirmation with the reason first. The server checks this too: it answers "needs approval" unless the request says it was approved.
+- Always refused, even when approved: `rm -r` on `/`, `~`, `$HOME` or `..`, `mkfs`, `dd` to a device, fork bombs, `shutdown` and `reboot`, `chmod -R` on `/`.
+- Run tests: the same project test runner the Auto tab uses, with a syntax check first. It asks first because it executes the project's code.
+- Ollama: up or down, response time, version, installed models and which model is loaded in memory (with VRAM). Refreshes every 10 s while the tab is open. A failed check shows the error.
+- SSH tunnel: shows whether port 11434 is open and whether an ssh forward process exists. Start, Stop and Restart manage the tunnel (each asks first). Stop only ends ssh processes that forward that port. A failed start shows the ssh error.
+- Resources: This phone (load, memory, disk, uptime). Inspect server (SSH) runs one fixed read-only command on the server (uptime, memory, disk, GPU through nvidia-smi if present, top processes). You cannot type your own command into it.
+
+Env vars: `PWA_SSH_HOST` (default `ubuntu@41.75.113.54`) and `PWA_SSH_KEY` (default `~/.ssh/server_ssh_key`). Commands run with your Termux user's permissions, so approve only what you understand. The app still binds to 127.0.0.1 only.
+
 ## Memory
 
 Lightweight and optional: a single small JSON file, `~/batacode-workspace/.batacode-memory.json` (max 50 notes, 300 characters each). Notes are sent to the model with every message.
@@ -89,7 +103,7 @@ Big prompts only stay in the model's context until the next Auto action, and onl
 
     python3 -m unittest discover -s tests -v
 
-Covers the automation tools (version-range logic, scanner rules, checks, file selection, apply safety, dependency analysis with a fake registry) and patch management (change review, ZIP contents, generated commands, hostile input). No network or Ollama needed.
+Covers the automation tools (version-range logic, scanner rules, checks, file selection, apply safety, dependency analysis with a fake registry) patch management (change review, ZIP contents, generated commands, hostile input) and the terminal tools (approval rules, blocked commands, timeouts and output caps, Ollama status with a fake server, tunnel start and stop with a fake ssh). No network or Ollama needed.
 
 ## Notes
 

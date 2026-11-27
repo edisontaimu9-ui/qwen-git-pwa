@@ -7,12 +7,14 @@ import http.client
 import json
 import os
 import socket
+import stat
+import textwrap
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -263,6 +265,259 @@ class EndpointTests(unittest.TestCase):
             server.latest_info = original
         self.assertEqual(code, 200)
         self.assertTrue(j["offline"])
+
+
+class FakeOllama(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = {
+            "/api/tags": {"models": [{"name": "qwen3-coder:30b", "size": 18_000_000_000}]},
+            "/api/version": {"version": "0.9.9"},
+            "/api/ps": {"models": [{"name": "qwen3-coder:30b", "size": 20_000_000_000, "size_vram": 19_000_000_000,
+                                    "expires_at": "2026-11-28T10:00:00Z"}]},
+        }.get(self.path)
+        data = json.dumps(body if body is not None else {}).encode()
+        self.send_response(200 if body is not None else 404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def free_port():
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+class TerminalTests(unittest.TestCase):
+    """Terminal and server management: approvals, output, resources, Ollama and tunnel."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", PORT), server.Handler)
+        cls.srv.daemon_threads = True
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.api = Api()
+        cls.repo = make_repo("term", {"a.txt": "hello\n"})
+        cls.fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
+        threading.Thread(target=cls.fake.serve_forever, daemon=True).start()
+        cls.saved = (server.OLLAMA, server.TUNNEL_PORT, server.SSH_KEY, server.SSH_HOST, os.environ["PATH"])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fake.shutdown()
+        cls.fake.server_close()
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def tearDown(self):
+        server.OLLAMA, server.TUNNEL_PORT, server.SSH_KEY, server.SSH_HOST, os.environ["PATH"] = self.saved
+
+    def point_at_fake(self):
+        server.OLLAMA = server.urlparse("http://127.0.0.1:%d" % self.fake.server_address[1])
+
+    # --- command approval ---
+    def test_classify(self):
+        cases = {
+            "ls -la": "safe", "git status": "safe", "git log --oneline -5": "safe", "git diff HEAD~1": "safe",
+            "git branch": "safe", "git remote -v": "safe", "python3 --version": "safe", "echo reboot": "safe",
+            "git push": "approve", "git branch -D x": "approve", "git remote add x y": "approve",
+            "ls; rm x": "approve", "cat a | sh": "approve", "echo $(whoami)": "approve", "ls *.py": "approve",
+            "cat ~/.bashrc": "approve", "pip install x": "approve", "python3 app.py": "approve",
+            "rm -rf build": "approve", "rm -rf ./build": "approve", "rm -rf /tmp/x": "approve", "echo 'a": "approve",
+            "rm -rf /": "blocked", "rm -rf ~": "blocked", "rm -fr /*": "blocked", "sudo rm -rf $HOME": "blocked",
+            "ls && rm -rf ~/": "blocked", "rm -r ..": "blocked", "mkfs.ext4 /dev/sda": "blocked",
+            "dd if=a of=/dev/sda": "blocked", ":(){ :|:& };:": "blocked", "reboot": "blocked",
+            "chmod -R 777 /": "blocked",
+        }
+        wrong = {c: server.classify_command(c)[0] for c, w in cases.items() if server.classify_command(c)[0] != w}
+        self.assertEqual(wrong, {})
+
+    def test_exec_safe_command_runs_without_approval(self):
+        code, j = self.api.post("/api/exec", {"cmd": "echo hello"})
+        self.assertEqual(code, 200)
+        self.assertEqual((j["output"], j["code"], j["ok"], j["approved"]), ("hello\n", 0, True, False))
+
+    def test_safe_commands_do_not_use_a_shell(self):
+        code, j = self.api.post("/api/exec", {"cmd": "echo a'b'c"})
+        self.assertEqual(j["output"], "abc\n")  # quoting handled, no shell involved
+        code, j = self.api.post("/api/exec", {"cmd": "git status", "cwd": "term"})
+        self.assertEqual(code, 200)
+        self.assertIn("On branch main", j["output"])
+
+    def test_exec_needs_approval_then_runs(self):
+        code, j = self.api.post("/api/exec", {"cmd": "echo a; echo b"})
+        self.assertEqual(code, 409)
+        self.assertTrue(j["needs_approval"])
+        self.assertTrue(j["reason"])
+        code, j = self.api.post("/api/exec", {"cmd": "echo a; echo b", "approved": True})
+        self.assertEqual((code, j["output"], j["approved"]), (200, "a\nb\n", True))
+
+    def test_approved_must_be_literally_true(self):
+        for v in ("true", 1, "yes"):
+            self.assertEqual(self.api.post("/api/exec", {"cmd": "echo a; echo b", "approved": v})[0], 409)
+
+    def test_blocked_commands_are_refused_even_when_approved(self):
+        code, j = self.api.post("/api/exec", {"cmd": "rm -rf ~", "approved": True})
+        self.assertEqual(code, 403)
+        self.assertIn("blocked", j["error"])
+
+    def test_exec_cwd_exit_code_and_stderr(self):
+        code, j = self.api.post("/api/exec", {"cmd": "pwd", "cwd": "term"})
+        self.assertTrue(j["output"].strip().endswith("/term"))
+        code, j = self.api.post("/api/exec", {"cmd": "echo oops 1>&2; exit 3", "approved": True})
+        self.assertEqual((j["code"], j["ok"]), (3, False))
+        self.assertIn("oops", j["output"])  # stderr is shown too
+        self.assertEqual(self.api.post("/api/exec", {"cmd": "pwd", "cwd": "nope"})[0], 404)
+        self.assertEqual(self.api.post("/api/exec", {"cmd": "pwd", "cwd": "../x"})[0], 400)
+        self.assertEqual(self.api.post("/api/exec", {"cmd": "  "})[0], 400)
+
+    def test_missing_command(self):
+        code, j = self.api.post("/api/exec", {"cmd": "definitely-not-a-command-xyz", "approved": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(j["code"], 127)
+
+    def test_exec_timeout_kills_the_command(self):
+        code, j = self.api.post("/api/exec", {"cmd": "sleep 30", "approved": True, "timeout": 1})
+        self.assertEqual(code, 200)
+        self.assertTrue(j["timed_out"])
+        self.assertLess(j["seconds"], 5)
+
+    def test_exec_output_is_capped(self):
+        code, j = self.api.post("/api/exec", {"cmd": "head -c 3000000 /dev/zero | tr '\\0' x", "approved": True})
+        self.assertEqual(code, 200)
+        self.assertTrue(j["truncated"])
+        self.assertLessEqual(len(j["output"]), server.MAX_OUT + 40)
+
+    def test_exec_requires_the_pwa_header(self):
+        c = http.client.HTTPConnection("127.0.0.1", PORT)
+        c.request("POST", "/api/exec", body=b'{"cmd":"echo hi"}', headers={"Host": "127.0.0.1:%d" % PORT})
+        self.assertEqual(c.getresponse().status, 403)
+
+    # --- resources ---
+    def test_sysinfo(self):
+        code, j = self.api.get("/api/sysinfo")
+        self.assertEqual(code, 200)
+        self.assertGreater(j["disk"]["total"], 0)
+        self.assertIn("python", j)
+        self.assertIn("pid", j)
+
+    def test_server_info_over_ssh_uses_a_fixed_command(self):
+        seen = []
+        original = server.run_ssh
+        server.run_ssh = lambda cmd, timeout=25: (seen.append(cmd) or (True, "up 3 days"))
+        try:
+            code, j = self.api.get("/api/server_info")
+        finally:
+            server.run_ssh = original
+        self.assertEqual((code, j["ok"], j["output"]), (200, True, "up 3 days"))
+        self.assertEqual(seen, [server.REMOTE_STATS])
+
+    def test_run_ssh_reports_a_missing_key(self):
+        server.SSH_KEY = "/nonexistent/key"
+        ok, text = server.run_ssh("uptime")
+        self.assertFalse(ok)
+        self.assertIn("SSH key not found", text)
+
+    # --- Ollama ---
+    def test_ollama_up(self):
+        self.point_at_fake()
+        code, j = self.api.get("/api/ollama_status")
+        self.assertEqual(code, 200)
+        self.assertTrue(j["up"])
+        self.assertEqual(j["version"], "0.9.9")
+        self.assertEqual(j["models"][0]["name"], "qwen3-coder:30b")
+        self.assertEqual(j["running"][0]["size_vram"], 19_000_000_000)
+        self.assertIsInstance(j["latency_ms"], int)
+
+    def test_ollama_down(self):
+        server.OLLAMA = server.urlparse("http://127.0.0.1:%d" % free_port())
+        code, j = self.api.get("/api/ollama_status")
+        self.assertEqual(code, 200)
+        self.assertFalse(j["up"])
+        self.assertTrue(j["error"])
+
+    # --- SSH tunnel ---
+    def test_tunnel_pids_reads_command_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            def proc(pid, *argv):
+                p = Path(d) / str(pid)
+                p.mkdir()
+                (p / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+            proc(101, "ssh", "-f", "-N", "-L", "12345:localhost:11434", "-i", "key", "u@h")
+            proc(102, "/usr/bin/ssh", "-N", "-L12345:localhost:11434", "u@h")
+            proc(103, "ssh", "-N", "-L", "8080:localhost:80", "u@h")      # other forward
+            proc(104, "sshd", "-L", "12345:x:1")                          # not ssh
+            proc(105, "python3", "ssh", "-L", "12345:x:1")                # not ssh
+            (Path(d) / "self").mkdir()
+            self.assertEqual(server.tunnel_pids(12345, d), [101, 102])
+            self.assertEqual(server.tunnel_pids(8080, d), [103])
+            self.assertEqual(server.tunnel_pids(12345, "/nonexistent"), [])
+
+    def test_tunnel_status_start_refused_when_up_and_bad_action(self):
+        self.point_at_fake()
+        server.TUNNEL_PORT = self.fake.server_address[1]
+        code, j = self.api.get("/api/tunnel")
+        self.assertEqual(code, 200)
+        self.assertTrue(j["listening"])
+        code, j = self.api.post("/api/tunnel", {"action": "start"})
+        self.assertEqual(code, 200)
+        self.assertIn("already in use", j["message"])
+        self.assertEqual(self.api.post("/api/tunnel", {"action": "explode"})[0], 400)
+
+    def test_tunnel_start_needs_the_key(self):
+        server.OLLAMA = server.urlparse("http://127.0.0.1:%d" % free_port())
+        server.TUNNEL_PORT = server.OLLAMA.port
+        server.SSH_KEY = "/nonexistent/key"
+        code, j = self.api.post("/api/tunnel", {"action": "start"})
+        self.assertEqual(code, 400)
+        self.assertIn("SSH key not found", j["error"])
+        self.assertEqual(self.api.post("/api/tunnel", {"action": "stop"})[1]["message"], "No tunnel process found.")
+
+    def test_tunnel_start_and_stop_with_a_fake_ssh(self):
+        port = free_port()
+        with tempfile.TemporaryDirectory() as d:
+            fake_py = Path(d) / "fake_ssh.py"
+            fake_py.write_text(textwrap.dedent("""
+                import socket, sys, time
+                spec = sys.argv[sys.argv.index("-L") + 1]
+                s = socket.socket()
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", int(spec.split(":")[0])))
+                s.listen(5)
+                while True:
+                    c, _ = s.accept()
+                    c.close()
+            """))
+            fake = Path(d) / "ssh"
+            fake.write_text('#!/bin/bash\nexec -a ssh python3 "%s" "$@"\n' % fake_py)
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            key = Path(d) / "key"
+            key.write_text("x")
+            os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
+            server.OLLAMA = server.urlparse("http://127.0.0.1:%d" % port)
+            server.TUNNEL_PORT = port
+            server.SSH_KEY = str(key)
+            server.SSH_HOST = "user@example.invalid"
+            try:
+                code, j = self.api.post("/api/tunnel", {"action": "start"})
+                self.assertEqual(code, 200, j)
+                self.assertIn("Tunnel started", j["message"])
+                self.assertTrue(j["status"]["listening"])
+                self.assertTrue(j["status"]["pids"])
+                code, j = self.api.post("/api/tunnel", {"action": "restart"})
+                self.assertEqual(code, 200, j)
+                self.assertIn("Stopped 1", j["message"])
+                self.assertIn("Tunnel started", j["message"])
+                self.assertTrue(j["status"]["listening"])
+            finally:
+                code, j = self.api.post("/api/tunnel", {"action": "stop"})
+            self.assertIn("Stopped", j["message"])
+            self.assertFalse(j["status"]["listening"])
+            self.assertEqual(j["status"]["pids"], [])
 
 
 def tearDownModule():
