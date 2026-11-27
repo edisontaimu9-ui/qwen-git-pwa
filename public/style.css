@@ -120,3 +120,11 @@ details summary { cursor: pointer; }
 #tForm { padding-bottom: env(safe-area-inset-bottom); }
 #tForm input { font-family: ui-monospace, monospace; }
 #term .row select { flex: 1; min-width: 0; }
+
+#aDiagram { overflow: auto; background: #0a0c11; border-radius: 8px; padding: 6px; max-height: 45vh; }
+#aDiagram[hidden] { display: none; }
+#aDiagram svg { display: block; }
+#aDiagram text { font: 11px ui-monospace, monospace; fill: #d6d9e2; }
+#aDiagram rect { fill: #1a1e29; stroke: #3558a8; }
+#aDiagram path { fill: none; stroke: #5b6378; stroke-width: 1.2; }
+#aDiagram .cap { color: #8b93a8; font-size: 12px; margin: 4px 2px; }

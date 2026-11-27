@@ -1041,6 +1041,7 @@ let autoBusy = false;
 const AUTO_LABEL = {
   analyze: "Analyze project", bugs: "Find and fix bugs", feature: "Build a feature", review: "Review code",
   tests: "Generate tests", docs: "Write docs", deps: "Check dependencies",
+  explain: "Explain repo", arch: "Architecture diagram", api: "Analyse API endpoints", debt: "Technical debt", plan: "Plan milestones",
 };
 
 function autoBudget() { return Math.round((Number($("#ctx").value) || 8192) * 1.6); }
@@ -1256,6 +1257,186 @@ const AUTO = {
   },
 };
 
+// ----- development intelligence helpers -----
+function topList(items, fmt, n) { return items.slice(0, n || 10).map(fmt).join("\n") || "none"; }
+
+// Layered SVG drawing of the import graph (no libraries). Longest-path layers, left to right.
+function drawDiagram(files, edges) {
+  const box = $("#aDiagram");
+  box.textContent = "";
+  const deg = {};
+  edges.forEach((e) => { deg[e.from] = (deg[e.from] || 0) + 1; deg[e.to] = (deg[e.to] || 0) + 1; });
+  let nodes = Array.from(new Set(edges.flatMap((e) => [e.from, e.to])));
+  if (!nodes.length) nodes = files.slice(0, 12);
+  nodes = nodes.sort((a, b) => (deg[b] || 0) - (deg[a] || 0) || (a < b ? -1 : 1)).slice(0, 30);
+  const keep = new Set(nodes);
+  const es = edges.filter((e) => keep.has(e.from) && keep.has(e.to));
+  const layer = {};
+  nodes.forEach((n) => { layer[n] = 0; });
+  for (let it = 0; it < nodes.length; it++) {
+    let ch = false;
+    es.forEach((e) => { if (layer[e.to] < layer[e.from] + 1 && layer[e.from] + 1 < nodes.length) { layer[e.to] = layer[e.from] + 1; ch = true; } });
+    if (!ch) break;
+  }
+  const cols = {};
+  nodes.forEach((n) => { (cols[layer[n]] = cols[layer[n]] || []).push(n); });
+  const W = 150, H = 26, GX = 50, GY = 12;
+  const pos = {};
+  const nCols = Object.keys(cols).length;
+  let maxRows = 0;
+  Object.keys(cols).sort((a, b) => a - b).forEach((c, ci) => {
+    cols[c].sort();
+    maxRows = Math.max(maxRows, cols[c].length);
+    cols[c].forEach((n, ri) => { pos[n] = { x: 8 + ci * (W + GX), y: 8 + ri * (H + GY) }; });
+  });
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", 16 + nCols * (W + GX) - GX);
+  svg.setAttribute("height", 16 + maxRows * (H + GY) - GY);
+  const mk = (tag, attrs) => { const e = document.createElementNS(ns, tag); Object.keys(attrs).forEach((k) => e.setAttribute(k, attrs[k])); return e; };
+  es.forEach((e) => {
+    const a = pos[e.from], b = pos[e.to];
+    const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2, mx = (x1 + x2) / 2;
+    svg.appendChild(mk("path", { d: "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2 }));
+  });
+  nodes.forEach((n) => {
+    const p = pos[n];
+    svg.appendChild(mk("rect", { x: p.x, y: p.y, width: W, height: H, rx: 6 }));
+    const t = mk("text", { x: p.x + 6, y: p.y + 17 });
+    t.textContent = n.length > 22 ? "…" + n.slice(-21) : n;
+    const ti = document.createElementNS(ns, "title");
+    ti.textContent = n;
+    t.appendChild(ti);
+    svg.appendChild(t);
+  });
+  const cap = document.createElement("div");
+  cap.className = "cap";
+  cap.textContent = "Imports go left to right: a file points to the files it uses. " + nodes.length + " files, " + es.length + " links.";
+  box.appendChild(cap);
+  box.appendChild(svg);
+  box.hidden = false;
+}
+
+AUTO.explain = async function (req, step) {
+  step("Scanning project...");
+  const j = await api("/api/analyze?repo=" + enc(currentRepo) + "&budget=" + Math.round(autoBudget() * 0.4));
+  const g = await api("/api/arch?repo=" + enc(currentRepo));
+  const langs = j.languages.map((l) => l.name + " " + l.files + " files, " + l.loc + " lines").join("; ") || "none detected";
+  step(j.files + " files. Most imported: " + (g.most_imported.map((x) => x.path).slice(0, 3).join(", ") || "n/a"));
+  const content = [
+    "I am new to the repository \"" + j.repo + "\". Explain it to me like a patient senior colleague, using only the facts below." + (req ? " Focus: " + req : ""),
+    "", "Facts:",
+    "- " + j.files + " files. Languages: " + langs,
+    "- Manifests: " + (j.manifests.join(", ") || "none") + ". Entry points: " + (j.entry.join(", ") || "none found"),
+    "- Most imported files (the core): " + topList(g.most_imported, (x) => x.path + " (" + x.count + ")", 6),
+    "- Files that depend on the most others: " + topList(g.most_dependent, (x) => x.path + " (" + x.count + ")", 6),
+    "- Tests: " + (j.has_tests ? j.tests.slice(0, 10).join(", ") : "none found"),
+    "", "Key files:", fmtFiles(j.key_files.map((k) => ({ path: k.path, content: k.head }))),
+    "", "File list:", j.tree + (j.more ? "\n... and " + j.more + " more files" : ""),
+    "", "Answer with: 1) What it is in two sentences. 2) A reading order: the 5 files to open first and why. 3) How a typical request or action flows " +
+      "through the code, step by step, naming files. 4) Key concepts and terms, one line each. 5) How to run it and where to make common changes. " +
+      "6) What is confusing or fragile for a newcomer. Do not invent files or behaviour you cannot see, and say what you could not check.",
+  ].join("\n");
+  return { content, shown: "Explain repo" + (req ? ": " + req : "") + "\n[" + j.files + " files]" };
+};
+
+AUTO.arch = async function (req, step) {
+  step("Reading imports...");
+  const g = await api("/api/arch?repo=" + enc(currentRepo));
+  step(g.files + " code files, " + g.edges.length + " import links, " + g.cycles.length + " cycles.");
+  drawDiagram(g.isolated, g.edges);
+  step("Diagram drawn above. Asking the model to explain it and write a Mermaid version.");
+  const b = await api("/api/bundle", { repo: currentRepo, paths: g.most_imported.map((x) => x.path), scope: "paths", budget: Math.round(autoBudget() * 0.5) });
+  const content = [
+    "Describe the architecture of repo \"" + currentRepo + "\" from the import graph and files below." + (req ? " Focus: " + req : ""),
+    "", "Import links (from -> to):", g.edges.slice(0, 150).map((e) => e.from + " -> " + e.to).join("\n") || "none found",
+    "", "Folders (file counts): " + Object.keys(g.folders).map((k) => k + " " + g.folders[k]).join(", "),
+    "Most imported: " + topList(g.most_imported, (x) => x.path + " (" + x.count + ")", 8),
+    "Isolated files (no imports in or out): " + (g.isolated.join(", ") || "none"),
+    "Circular imports: " + (g.cycles.map((c) => c.join(" -> ")).join(" | ") || "none"),
+    "", "Core files:", fmtFiles(b.files),
+    "", "Auto-generated Mermaid graph (file level) you may refine:", "~~~~", g.mermaid, "~~~~",
+    "", "Answer with: (1) layers or components and what each does; (2) a Mermaid diagram of the components, in a fenced block tagged mermaid, " +
+      "with at most 15 nodes and labelled arrows (for example `flowchart TD`); (3) the main data flow in numbered steps; " +
+      "(4) architecture problems: cycles, god files, unclear boundaries, with the file names. Mention which links come only from imports and may miss " +
+      "runtime links such as HTTP calls, since you cannot see those from imports.",
+  ].join("\n");
+  return { content, shown: "Architecture diagram" + (req ? ": " + req : "") + "\n[" + g.files + " files, " + g.edges.length + " links]" };
+};
+
+AUTO.api = async function (req, step) {
+  step("Finding routes and callers...");
+  const j = await api("/api/endpoints?repo=" + enc(currentRepo));
+  if (!j.count) { step("No routes found (looked for Flask, FastAPI, Express, Django and route tables)."); return null; }
+  step(j.count + " endpoints, " + j.calls + " calls in client code, " + j.unused.length + " not called from this repo.");
+  const rows = j.endpoints.slice(0, 120).map((e) => "- " + e.method + " " + e.path + " -> " + (e.handler || "(inline)") + " [" + e.file + ":" + e.line + "]" +
+    (e.called_by_repo ? "" : " NOT CALLED IN REPO") + (e.hints.length ? " hints: " + e.hints.join(",") : ""));
+  const files = Array.from(new Set(j.endpoints.map((e) => e.file))).slice(0, 8);
+  const b = await api("/api/bundle", { repo: currentRepo, paths: files, scope: "paths", budget: Math.round(autoBudget() * 0.6) });
+  const content = [
+    "Analyse the HTTP API of repo \"" + currentRepo + "\"." + (req ? " Focus: " + req : ""),
+    "", "Endpoints found by a static scan (" + j.count + (j.capped ? ", list capped" : "") + "):", rows.join("\n"),
+    ...(j.unknown_calls.length ? ["", "Client calls to paths with no matching route: " + j.unknown_calls.join(", ")] : []),
+    "", "Source:", fmtFiles(b.files),
+    "", "Report: (1) a table of endpoints: method, path, purpose, input, output; (2) consistency problems in naming, methods, status codes and error shapes; " +
+      "(3) security: missing authentication, missing input validation, path traversal, command execution, CORS, rate limits (only what the code shows); " +
+      "(4) endpoints nothing calls and client calls with no endpoint; (5) missing endpoints or tests, and the 5 most valuable fixes with file names. " +
+      "The scan is static, so say when dynamically registered routes could be missing.",
+  ].join("\n");
+  return { content, shown: "Analyse API endpoints" + (req ? ": " + req : "") + "\n[" + j.count + " endpoints]" };
+};
+
+AUTO.debt = async function (req, step) {
+  step("Measuring technical debt...");
+  const j = await api("/api/debt?repo=" + enc(currentRepo));
+  const c = j.scan_counts;
+  step(j.marker_count + " TODO/FIXME markers, " + j.complex_functions.length + " heavy functions, " + j.long_files.length + " long files, " +
+    j.duplicates.length + " duplicate blocks, " + j.untested.length + " untested files, scan: " + c.high + " high / " + c.medium + " medium / " + c.low + " low.");
+  const hot = j.hotspots.map((x) => x.path).concat(j.complex_functions.map((x) => x.path), j.long_files.map((x) => x.path));
+  const b = await api("/api/bundle", { repo: currentRepo, paths: Array.from(new Set(hot)).slice(0, 6), scope: "paths", budget: Math.round(autoBudget() * 0.5) });
+  const content = [
+    "Assess the technical debt of repo \"" + currentRepo + "\" from these measurements." + (req ? " Focus: " + req : ""),
+    "", "Markers (" + j.marker_count + "):", topList(j.markers, (m) => "- " + m.path + ":" + m.line + " " + m.kind + " " + m.text, 25),
+    "", "Long files:", topList(j.long_files, (f) => "- " + f.path + " " + f.lines + " lines"),
+    "", "Heavy functions (long, many branches or many arguments):", topList(j.complex_functions, (f) => "- " + f.path + ":" + f.line + " " + f.name + " " + f.length + " lines, complexity " + f.complexity + ", " + f.args + " args"),
+    "", "Duplicated 6-line blocks:", topList(j.duplicates, (d) => "- " + d.map((x) => x.path + ":" + x.line).join(" = ")),
+    "", "Source files whose name never appears in the tests: " + (j.has_tests ? topList(j.untested, (u) => u.path + " (" + u.lines + ")", 10) : "there are no tests at all"),
+    "", "Churn hotspots (changed often and big, last 180 days):", topList(j.hotspots, (x) => "- " + x.path + " " + x.commits + " commits, " + x.lines + " lines"),
+    "", "Pattern scan: " + c.high + " high, " + c.medium + " medium, " + c.low + " low.", topList(j.scan_top, (f) => "- [" + f.severity + "] " + f.path + ":" + f.line + " " + (f.message || f.msg || f.id || ""), 10),
+    "", "Worst files:", fmtFiles(b.files),
+    "", "Report: (1) a debt register: item, file, why it hurts, effort (S/M/L), risk if ignored, ranked by value for effort; (2) quick wins for one afternoon; " +
+      "(3) the refactors worth planning, with a safe first step for each; (4) what to leave alone. Use only the measurements shown and say when a figure is a rough heuristic.",
+  ].join("\n");
+  return { content, shown: "Technical debt" + (req ? ": " + req : "") + "\n[" + j.marker_count + " markers, " + j.complex_functions.length + " heavy functions]" };
+};
+
+AUTO.plan = async function (req, step) {
+  step("Collecting project facts...");
+  const a = await api("/api/analyze?repo=" + enc(currentRepo) + "&budget=2500");
+  const d = await api("/api/debt?repo=" + enc(currentRepo));
+  const e = await api("/api/endpoints?repo=" + enc(currentRepo)).catch(() => ({ count: 0, endpoints: [] }));
+  let log = "";
+  try {
+    const l = await api("/api/log?repo=" + enc(currentRepo));
+    log = (l.commits || l.log || []).slice(0, 15).map((c) => "- " + (c.subject || c.msg || c.message || JSON.stringify(c))).join("\n");
+  } catch (x) { log = ""; }
+  step(a.files + " files, " + d.marker_count + " markers, " + e.count + " endpoints.");
+  const content = [
+    "Plan development milestones for repo \"" + currentRepo + "\"." + (req ? " Goal from the owner: " + req : " No goal was given, so propose sensible goals and state your assumptions."),
+    "", "State of the project:",
+    "- " + a.files + " files; languages: " + (a.languages.map((l) => l.name + " " + l.loc + " lines").join(", ") || "unknown"),
+    "- Tests: " + (a.has_tests ? a.tests.length + " test files" : "none") + ". API endpoints: " + e.count,
+    "- Debt: " + d.marker_count + " TODO/FIXME, " + d.complex_functions.length + " heavy functions, " + d.long_files.length + " long files, " + d.untested.length + " untested files, scan " + d.scan_counts.high + " high / " + d.scan_counts.medium + " medium",
+    "- Unfinished markers:", topList(d.markers, (m) => "  " + m.path + ":" + m.line + " " + m.text, 15),
+    "", "Recent commits (newest first):", log || "not available",
+    "", "README / key files:", fmtFiles(a.key_files.slice(0, 3).map((k) => ({ path: k.path, content: k.head.slice(0, 1500) }))),
+    "", "Write: (1) a one-paragraph assessment of where the project stands; (2) 3 to 5 milestones, each with a goal, the concrete tasks (name the files), " +
+      "a rough size in days for one developer working part time, dependencies, how to know it is done, and the main risk; (3) the order and why; " +
+      "(4) what to cut if time runs short; (5) the single next task to start today. Keep it realistic for a solo developer working from a phone.",
+  ].join("\n");
+  return { content, shown: "Plan milestones" + (req ? ": " + req : "") + "\n[" + a.files + " files, " + d.marker_count + " markers]" };
+};
+
 async function autoRun(kind, reqText) {
   if (autoBusy) return;
   if (!currentRepo) { toast("Pick a repo in the Repos tab first"); return; }
@@ -1269,6 +1450,7 @@ async function autoRun(kind, reqText) {
   const btns = document.querySelectorAll("#aBtns button");
   btns.forEach((b) => { b.disabled = true; });
   const out = $("#aOut");
+  $("#aDiagram").hidden = true;
   out.textContent = AUTO_LABEL[kind] + "...\n";
   const step = (t) => { out.textContent += t + "\n"; };
   try {

@@ -2033,6 +2033,356 @@ def r_tunnel_post(h, q):
 
 
 
+# 6. Development intelligence: architecture graph, API endpoints, technical debt ----
+
+CODE_EXT = {".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".html", ".htm"}
+
+
+def _module_name(path):
+    p = Path(path)
+    return str(p.with_suffix("")).replace("/", ".")
+
+
+def build_arch(root, names):
+    """File-level import graph (Python, JS/TS, HTML script tags) resolved inside the repo."""
+    files = [n for n in names if Path(n).suffix.lower() in CODE_EXT]
+    fset = set(files)
+    pymods = {}
+    for n in files:
+        if n.endswith(".py"):
+            m = _module_name(n)
+            pymods[m] = n
+            if m.endswith(".__init__"):
+                pymods[m[:-9]] = n
+    edges = set()
+
+    def js_resolve(src, spec):
+        base = Path(src).parent / spec
+        parts = []
+        for x in base.parts:
+            if x == "..":
+                if parts:
+                    parts.pop()
+            elif x != ".":
+                parts.append(x)
+        b = "/".join(parts)
+        for cand in (b, b + ".js", b + ".mjs", b + ".ts", b + ".tsx", b + ".jsx", b + "/index.js", b + "/index.ts"):
+            if cand in fset:
+                return cand
+        return None
+
+    for n in files:
+        t = read_text(root, n, 400_000)
+        if t is None:
+            continue
+        ext = Path(n).suffix.lower()
+        if ext == ".py":
+            try:
+                tree = ast.parse(t)
+            except (SyntaxError, ValueError, RecursionError):
+                continue
+            here = _module_name(n).split(".")
+            for node in ast.walk(tree):
+                mods = []
+                if isinstance(node, ast.Import):
+                    mods = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        pkg = here[:-1]
+                        pkg = pkg[:max(0, len(pkg) - (node.level - 1))]
+                        base = ".".join(pkg + ([node.module] if node.module else []))
+                    else:
+                        base = node.module or ""
+                    subs = [base + "." + a.name for a in node.names if base]
+                    mods = subs if any(x in pymods for x in subs) else [base] + subs
+                for m in mods:
+                    tgt = pymods.get(m)
+                    if not tgt and "." in m:
+                        tgt = pymods.get(m.rsplit(".", 1)[0]) if m.rsplit(".", 1)[0] in pymods else None
+                    if not tgt:  # top-level script next to the importer
+                        cand = str(Path(n).parent / (m.split(".")[0] + ".py")).lstrip("./")
+                        tgt = cand if cand in fset else None
+                    if tgt and tgt != n:
+                        edges.add((n, tgt))
+        elif ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
+            for m in re.finditer(r"""(?:\bfrom\s+|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"](\.{1,2}/[^'"]+)['"]""", t):
+                tgt = js_resolve(n, m.group(1))
+                if tgt and tgt != n:
+                    edges.add((n, tgt))
+        else:
+            for m in re.finditer(r"""<script[^>]+src=["']([^"':]+)["']""", t, re.I):
+                tgt = js_resolve(n, m.group(1)) or js_resolve(n, "./" + m.group(1))
+                if tgt and tgt != n:
+                    edges.add((n, tgt))
+    return files, sorted(edges)
+
+
+def arch_mermaid(files, edges, limit=40):
+    deg = {}
+    for a, b in edges:
+        deg[a] = deg.get(a, 0) + 1
+        deg[b] = deg.get(b, 0) + 1
+    keep = set(sorted(files, key=lambda f: (-deg.get(f, 0), f))[:limit])
+    keep = {f for f in keep if deg.get(f)} or keep
+    ids = {f: "n%d" % i for i, f in enumerate(sorted(keep))}
+    lines = ["flowchart LR"]
+    for f, i in ids.items():
+        lines.append('  %s["%s"]' % (i, f.replace('"', "")))
+    for a, b in edges:
+        if a in ids and b in ids:
+            lines.append("  %s --> %s" % (ids[a], ids[b]))
+    return "\n".join(lines)
+
+
+def r_arch(h, q):
+    root = repo_path(q.get("repo"))
+    names = repo_files(root)
+    files, edges = build_arch(root, names)
+    indeg, outdeg = {}, {}
+    for a, b in edges:
+        outdeg[a] = outdeg.get(a, 0) + 1
+        indeg[b] = indeg.get(b, 0) + 1
+    # Cycles (simple DFS) are a real architecture smell worth reporting.
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a, []).append(b)
+    cycles, state = [], {}
+
+    def dfs(n, stack):
+        state[n] = 1
+        stack.append(n)
+        for m in adj.get(n, []):
+            if state.get(m) == 1 and len(cycles) < 10:
+                cycles.append(stack[stack.index(m):] + [m])
+            elif m not in state:
+                dfs(m, stack)
+        stack.pop()
+        state[n] = 2
+
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(old, 5000))
+    try:
+        for n in sorted(adj):
+            if n not in state:
+                dfs(n, [])
+    finally:
+        sys.setrecursionlimit(old)
+    folders = {}
+    for f in files:
+        d = str(Path(f).parent) if "/" in f else "."
+        folders[d] = folders.get(d, 0) + 1
+    h.send_json(200, {
+        "repo": root.name, "files": len(files), "edges": [{"from": a, "to": b} for a, b in edges[:600]],
+        "most_imported": sorted(({"path": k, "count": v} for k, v in indeg.items()), key=lambda x: -x["count"])[:10],
+        "most_dependent": sorted(({"path": k, "count": v} for k, v in outdeg.items()), key=lambda x: -x["count"])[:10],
+        "isolated": [f for f in files if f not in indeg and f not in outdeg][:30],
+        "cycles": cycles, "folders": folders, "mermaid": arch_mermaid(files, edges),
+    })
+
+
+ROUTE_RULES = [
+    # (framework, regex with groups: method?, path)
+    ("flask/fastapi", re.compile(r"""@\w+\.(get|post|put|delete|patch|head|options)\(\s*['"]([^'"]+)['"]""")),
+    ("flask", re.compile(r"""@\w+\.route\(\s*['"]([^'"]+)['"](?:[^)]*methods\s*=\s*\[([^\]]*)\])?""")),
+    ("express", re.compile(r"""\b(?:app|router|server|api)\.(get|post|put|delete|patch|all|use)\(\s*['"`](/[^'"`]*)['"`]""")),
+    ("django", re.compile(r"""\b(?:re_)?path\(\s*r?['"]([^'"]*)['"]\s*,\s*([\w.]+)""")),
+    ("route table", re.compile(r"""\(\s*['"](GET|POST|PUT|DELETE|PATCH)['"]\s*,\s*['"](/[^'"]*)['"]\s*\)\s*:\s*([\w.]+)""")),
+]
+CALL_RE = re.compile(r"""(?:fetch|api|axios\.\w+|\$\.\w+|requests\.\w+|http\.\w+)\(\s*[`'"]([^`'"?$]*/[^`'"?$]*)""")
+
+
+def find_endpoints(root, names):
+    eps, calls = [], []
+    for n in names:
+        if Path(n).suffix.lower() not in CODE_EXT:
+            continue
+        t = read_text(root, n, 600_000)
+        if t is None:
+            continue
+        for i, line in enumerate(t.split("\n"), 1):
+            for fw, rx in ROUTE_RULES:
+                for m in rx.finditer(line):
+                    g = m.groups()
+                    if fw == "flask/fastapi":
+                        method, path, handler = g[0].upper(), g[1], ""
+                    elif fw == "flask":
+                        method = (re.sub(r"[\s'\"]", "", g[1] or "GET")).upper().replace(",", "|")
+                        path, handler = g[0], ""
+                    elif fw == "express":
+                        method, path, handler = g[0].upper(), g[1], ""
+                    elif fw == "django":
+                        method, path, handler = "ANY", "/" + g[0].lstrip("/"), g[1]
+                    else:
+                        method, path, handler = g[0], g[1], g[2]
+                    eps.append({"method": method, "path": path, "handler": handler, "file": n, "line": i, "framework": fw})
+            for m in CALL_RE.finditer(line):
+                if m.group(1).startswith("/") or m.group(1).startswith("http"):
+                    calls.append({"path": m.group(1), "file": n, "line": i})
+    return eps, calls
+
+
+def r_endpoints(h, q):
+    root = repo_path(q.get("repo"))
+    names = repo_files(root)
+    eps, calls = find_endpoints(root, names)
+    seen, uniq = set(), []
+    for e in eps:
+        k = (e["method"], e["path"], e["file"], e["line"])
+        if k not in seen:
+            seen.add(k)
+            uniq.append(e)
+    called = {c["path"].split("http://", 1)[-1] for c in calls}
+    for e in uniq:
+        e["called_by_repo"] = any(c == e["path"] or c.endswith(e["path"]) for c in called)
+    # Handlers declared in the same file: add a short summary of auth / validation hints.
+    for e in uniq:
+        t = read_text(root, e["file"], 600_000) or ""
+        lines = t.split("\n")
+        win = "\n".join(lines[e["line"] - 1:e["line"] + 25]).lower()
+        e["hints"] = [k for k, w in (("auth", ("auth", "token", "login_required", "jwt", "permission")),
+                                     ("validation", ("validate", "schema", "pydantic", "isinstance", "400")),
+                                     ("writes", ("write", "delete", "insert", "commit", "subprocess", "rmtree")))
+                      if any(x in win for x in w)]
+    called_paths = {c["path"] for c in calls}
+    h.send_json(200, {"repo": root.name, "count": len(uniq), "endpoints": uniq[:300],
+                      "calls": len(calls), "capped": len(uniq) > 300,
+                      "unused": [e["path"] for e in uniq if not e["called_by_repo"]][:60],
+                      "unknown_calls": sorted(p for p in called_paths if p.startswith("/") and
+                                              not any(e["path"] == p for e in uniq))[:40]})
+
+
+DEBT_MARKERS = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\s]*(.{0,100})")
+
+
+def _py_functions(text):
+    out = []
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            branches = sum(isinstance(x, (ast.If, ast.For, ast.While, ast.Try, ast.BoolOp, ast.ExceptHandler,
+                                          ast.IfExp, ast.comprehension)) for x in ast.walk(node))
+            out.append({"name": node.name, "line": node.lineno, "length": end - node.lineno + 1,
+                        "complexity": branches + 1, "args": len(node.args.args)})
+    return out
+
+
+def _js_functions(text):
+    """Rough: brace-balanced bodies of function declarations / arrow assignments."""
+    out = []
+    lines = text.split("\n")
+    rx = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function\s*\*?\s*(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:function|\([^)]*\)\s*=>|\w+\s*=>))")
+    for i, ln in enumerate(lines):
+        m = rx.match(ln)
+        if not m or "{" not in ln:
+            continue
+        depth, j = 0, i
+        while j < len(lines) and j - i < 2000:
+            depth += lines[j].count("{") - lines[j].count("}")
+            if depth <= 0 and j >= i:
+                break
+            j += 1
+        body = "\n".join(lines[i:j + 1])
+        br = len(re.findall(r"\b(if|for|while|case|catch)\b|&&|\|\||\?", body))
+        out.append({"name": m.group(1) or m.group(2), "line": i + 1, "length": j - i + 1, "complexity": br + 1, "args": 0})
+    return out
+
+
+def find_debt(root, names, test_names):
+    markers, long_files, funcs, dup_map = [], [], [], {}
+    sizes = {}
+    for n in names:
+        ext = Path(n).suffix.lower()
+        if ext not in CODE_EXT and ext not in (".css", ".sh", ".md"):
+            continue
+        t = read_text(root, n, 600_000)
+        if t is None:
+            continue
+        lines = t.split("\n")
+        sizes[n] = len(lines)
+        if ext in CODE_EXT and len(lines) > 600:
+            long_files.append({"path": n, "lines": len(lines)})
+        for i, ln in enumerate(lines, 1):
+            m = DEBT_MARKERS.search(ln)
+            if m and ext != ".md" and len(markers) < 120:
+                markers.append({"path": n, "line": i, "kind": m.group(1), "text": m.group(2).strip()})
+        if ext == ".py":
+            fl = _py_functions(t)
+        elif ext in (".js", ".mjs", ".jsx", ".ts", ".tsx"):
+            fl = _js_functions(t)
+        else:
+            fl = []
+        for f in fl:
+            if f["length"] > 60 or f["complexity"] > 15 or f["args"] > 6:
+                f["path"] = n
+                funcs.append(f)
+        if ext in CODE_EXT and n not in test_names:
+            norm = [re.sub(r"\s+", " ", x).strip() for x in lines]
+            for i in range(len(norm) - 5):
+                blk = norm[i:i + 6]
+                if sum(len(x) for x in blk) < 150 or any(len(x) < 3 for x in blk[:2]):
+                    continue
+                dup_map.setdefault(hash("\n".join(blk)), []).append((n, i + 1))
+    dups = []
+    for locs in dup_map.values():
+        if len({p for p, _ in locs}) > 1 or len(locs) > 1:
+            dups.append(locs[:4])
+    dups.sort(key=lambda l: -len(l))
+    funcs.sort(key=lambda f: -(f["length"] + f["complexity"] * 3))
+    long_files.sort(key=lambda f: -f["lines"])
+    return markers, long_files, funcs, dups[:15], sizes
+
+
+def git_churn(root, days=180):
+    try:
+        out = git_bytes(["log", "--since=%d.days" % days, "--name-only", "--pretty=format:", "-n", "400"], root, 30)
+    except ApiError:
+        return {}
+    c = {}
+    for ln in out.decode("utf-8", "replace").split("\n"):
+        if ln.strip():
+            c[ln.strip()] = c.get(ln.strip(), 0) + 1
+    return c
+
+
+def r_debt(h, q):
+    root = repo_path(q.get("repo"))
+    names = repo_files(root)
+    is_test = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*\.py$|_test\.py$|\.(test|spec)\.[jt]sx?$")
+    tests = {n for n in names if is_test.search(n)}
+    markers, long_files, funcs, dups, sizes = find_debt(root, names, tests)
+    test_text = ""
+    for n in sorted(tests)[:60]:
+        test_text += (read_text(root, n, 200_000) or "").lower() + "\n"
+    untested = []
+    for n in names:
+        if Path(n).suffix.lower() in (".py", ".js", ".mjs", ".ts") and n not in tests and sizes.get(n, 0) > 40:
+            stem = Path(n).stem.lower()
+            if stem not in test_text:
+                untested.append({"path": n, "lines": sizes[n]})
+    untested.sort(key=lambda x: -x["lines"])
+    churn = git_churn(root)
+    hot = sorted(({"path": p, "commits": c, "lines": sizes[p], "score": c * sizes[p]}
+                  for p, c in churn.items() if p in sizes and sizes[p] > 80), key=lambda x: -x["score"])[:8]
+    scan = []
+    for n in names:
+        t = read_text(root, n, 500_000)
+        if t is not None:
+            scan += scan_text(n, t)
+    counts = {s: sum(1 for f in scan if f["severity"] == s) for s in SEV_ORDER}
+    h.send_json(200, {
+        "repo": root.name, "files": len(names), "has_tests": bool(tests),
+        "markers": markers, "marker_count": len(markers),
+        "long_files": long_files[:10], "complex_functions": funcs[:15],
+        "duplicates": [[{"path": p, "line": l} for p, l in d] for d in dups],
+        "untested": untested[:15], "hotspots": hot, "scan_counts": counts,
+        "scan_top": sorted(scan, key=lambda f: (SEV_ORDER[f["severity"]], f["path"], f["line"]))[:15],
+    })
+
+
 ROUTES = {
     ("GET", "/api/memory"): r_memory_get,
     ("POST", "/api/memory"): r_memory_post,
@@ -2070,6 +2420,9 @@ ROUTES = {
     ("POST", "/api/apply"): r_apply,
     ("GET", "/api/review_scan"): r_review_scan,
     ("GET", "/api/deps"): r_deps,
+    ("GET", "/api/arch"): r_arch,
+    ("GET", "/api/endpoints"): r_endpoints,
+    ("GET", "/api/debt"): r_debt,
     ("POST", "/api/patch_plan"): r_patch_plan,
     ("POST", "/api/patch_zip"): r_patch_zip,
     ("POST", "/api/exec"): r_exec,

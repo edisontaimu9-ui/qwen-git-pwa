@@ -103,11 +103,21 @@ When a reply contains files labelled `File: path`, an Apply bar appears under it
 
 Big prompts only stay in the model's context until the next Auto action, and only their short summary is saved in the chat history. The amount of code sent per request follows the ctx menu (about 1.6 characters per token of context).
 
+## Development intelligence (Auto tab)
+
+Five more actions. Each measures the repo on the phone first (no model needed for that), then sends the facts to Qwen and the answer streams into Chat.
+
+- Explain repo: a guided tour for someone new: what it is, which 5 files to read first, how a request flows through the code, key terms, how to run it, what is fragile.
+- Architecture diagram: reads the imports (Python, JS/TS, script tags in HTML), draws the module map in the Auto tab (left to right, a file points to what it uses), reports circular imports, isolated files and the most imported files, and asks the model for a component diagram in Mermaid. It sees imports only, so HTTP calls between parts do not show.
+- Analyse API endpoints: finds routes in Flask, FastAPI, Express, Django and `("GET", "/path"): handler` route tables, matches them with calls in the repo's own client code, and lists endpoints nothing calls and calls with no endpoint. The model then reviews naming, status codes and security. Routes registered dynamically are not found.
+- Technical debt: counts TODO/FIXME/HACK markers, long files, long or branch-heavy functions (rough heuristic), duplicated 6-line blocks, source files whose name never appears in the tests, and churn hotspots (big files changed often in the last 180 days), plus the security scan. The model turns that into a ranked debt register with quick wins.
+- Plan milestones: puts project size, tests, debt, endpoints and recent commits together and asks for 3 to 5 milestones with tasks, sizes, order and the next task to start. Type your goal in the text box first for a plan toward it.
+
 ## Tests
 
     python3 -m unittest discover -s tests -v
 
-Covers the automation tools (version-range logic, scanner rules, checks, file selection, apply safety, dependency analysis with a fake registry) patch management (change review, ZIP contents, generated commands, hostile input) and the terminal tools (approval rules, blocked commands, timeouts and output caps, Ollama status with a fake server, tunnel start and stop with a fake ssh). No network or Ollama needed.
+Covers the automation tools (version-range logic, scanner rules, checks, file selection, apply safety, dependency analysis with a fake registry) patch management (change review, ZIP contents, generated commands, hostile input) the development intelligence scans (imports, cycles, routes, debt) and the terminal tools (approval rules, blocked commands, timeouts and output caps, Ollama status with a fake server, tunnel start and stop with a fake ssh). No network or Ollama needed.
 
 ## Notes
 

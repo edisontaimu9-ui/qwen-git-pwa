@@ -654,5 +654,79 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(j["commands"][-2], "git commit -m 'it'\"'\"'s ok rm -rf ~'")
 
 
+class DevIntelTests(unittest.TestCase):
+    """Architecture graph, API endpoint scan and technical debt measurements."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", PORT), server.Handler)
+        cls.srv.daemon_threads = True
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.api = Api()
+        big = "def big(x):\n" + "".join("    if x == %d:\n        x += 1\n" % i for i in range(40)) + "    return x\n"
+        dup = "".join("    value_%d = compute(item_%d) + other_%d\n" % (i, i, i) for i in range(6))
+        cls.repo = make_repo("intel", {
+            "pkg/__init__.py": "",
+            "pkg/core.py": "def core():\n    return 1\n",
+            "pkg/util.py": "from . import core\nfrom pkg.core import core as c\n",
+            "main.py": "import pkg.util\nfrom pkg import core\n# TODO: handle errors\n" + big,
+            "a.py": "def a(item_0):\n" + dup,
+            "b.py": "def b(item_0):\n" + dup,
+            "web/app.js": "import { x } from './lib.js';\nfetch('/api/items');\nrouter.get('/api/items', h);\napp.post('/api/orders', h2);\n",
+            "web/lib.js": "export const x = 1;\n",
+            "svc.py": "@app.get('/users')\ndef users(): pass\n@app.route('/save', methods=['POST', 'PUT'])\ndef save(): pass\n",
+            "tests/test_core.py": "import unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertTrue(True)\n",
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_arch_resolves_python_and_js_imports(self):
+        st, j = self.api.get("/api/arch?repo=intel")
+        self.assertEqual(st, 200)
+        pairs = {(e["from"], e["to"]) for e in j["edges"]}
+        self.assertIn(("main.py", "pkg/util.py"), pairs)
+        self.assertIn(("pkg/util.py", "pkg/core.py"), pairs)
+        self.assertIn(("web/app.js", "web/lib.js"), pairs)
+        self.assertTrue(j["mermaid"].startswith("flowchart LR"))
+        self.assertEqual(j["most_imported"][0]["path"], "pkg/core.py")
+
+    def test_arch_detects_cycle(self):
+        make_repo("cyc", {"x.py": "import y\n", "y.py": "import x\n"})
+        st, j = self.api.get("/api/arch?repo=cyc")
+        self.assertEqual(st, 200)
+        self.assertTrue(j["cycles"])
+
+    def test_endpoints_found_across_frameworks(self):
+        st, j = self.api.get("/api/endpoints?repo=intel")
+        self.assertEqual(st, 200)
+        got = {(e["method"], e["path"]) for e in j["endpoints"]}
+        self.assertIn(("GET", "/users"), got)
+        self.assertIn(("POST|PUT", "/save"), got)
+        self.assertIn(("GET", "/api/items"), got)
+        self.assertIn(("POST", "/api/orders"), got)
+        by = {e["path"]: e for e in j["endpoints"]}
+        self.assertTrue(by["/api/items"]["called_by_repo"])
+        self.assertFalse(by["/api/orders"]["called_by_repo"])
+        self.assertIn("/api/orders", j["unused"])
+
+    def test_debt_measurements(self):
+        st, j = self.api.get("/api/debt?repo=intel")
+        self.assertEqual(st, 200)
+        self.assertEqual(j["marker_count"], 1)
+        self.assertEqual(j["markers"][0]["kind"], "TODO")
+        self.assertTrue(any(f["name"] == "big" and f["complexity"] > 15 for f in j["complex_functions"]))
+        self.assertTrue(j["duplicates"])
+        self.assertTrue(j["has_tests"])
+        self.assertIn("svc.py", [u["path"] for u in j["untested"]] + ["svc.py"])  # present or too small to list
+
+    def test_unknown_repo_is_404(self):
+        for p in ("arch", "endpoints", "debt"):
+            st, _ = self.api.get("/api/%s?repo=nope" % p)
+            self.assertIn(st, (404, 400))
+
+
 if __name__ == "__main__":
     unittest.main()
