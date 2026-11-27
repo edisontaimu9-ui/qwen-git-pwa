@@ -119,7 +119,14 @@
         <button id="edDel" type="button">Delete</button>
         <button id="edClose" type="button">Close</button>
       </div>
-      <textarea id="edText" spellcheck="false" wrap="off" autocapitalize="off" autocomplete="off"></textarea>
+      <div id="edSug" hidden></div>
+      <div id="edWrap">
+        <pre id="edGutter" aria-hidden="true"></pre>
+        <div id="edBox">
+          <pre id="edHi" aria-hidden="true"></pre>
+          <textarea id="edText" spellcheck="false" wrap="off" autocapitalize="off" autocorrect="off" autocomplete="off"></textarea>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -255,5 +262,6 @@
 </main>
 <div id="toast" hidden></div>
 <script src="app.js"></script>
+<script src="editor.js"></script>
 </body>
 </html>

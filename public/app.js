@@ -228,6 +228,7 @@ async function openFile(path, line) {
     dirty = false;
     const ta = $("#edText");
     ta.value = j.content;
+    if (window.EditorKit) window.EditorKit.setFile(path);
     $("#edName").textContent = currentRepo + "/" + path;
     $("#editor").hidden = false;
     $("#fList").hidden = true;

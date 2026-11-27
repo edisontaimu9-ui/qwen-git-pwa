@@ -34,6 +34,10 @@ The Git tab works on the selected repo.
 - Project: on sends the repo file list and git status with every message, which helps with debugging a whole project.
 - When the model writes a file it labels it `File: path`, so Save to repo and Download pre-fill the right name.
 
+## Code editor (Files tab)
+
+Opening a file shows a code editor: line numbers, syntax highlighting (JS/TS, Python, JSON, HTML/XML, CSS, shell), word completion and editing helpers. While you type, suggestions (keywords plus words from the file) appear as tappable chips above the editor. Tab indents (Shift+Tab outdents) the selected lines, Enter keeps the indent, and Ctrl+/ toggles comments. Files over 300 KB are shown without highlighting.
+
 ## Patch management (Patch tab)
 
 The whole change workflow in one place, built for a phone:
