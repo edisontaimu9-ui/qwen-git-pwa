@@ -38,6 +38,7 @@ function showTab(id) {
   if (id === "browse") renderBrowse();
   if (id === "git") gRefresh();
   if (id === "auto") autoRefresh();
+  if (id === "patch") patchRefresh();
 }
 document.querySelectorAll("nav button").forEach((b) => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -111,8 +112,12 @@ function selectRepo(name) {
   loadRepos();
   if ($("#browse").classList.contains("on")) renderBrowse();
   gUnchecked.clear();
+  pUnchecked.clear();
+  $("#pView").textContent = "";
+  $("#pOut").textContent = "";
   $("#gView").textContent = "";
   if ($("#git").classList.contains("on")) gRefresh();
+  if ($("#patch").classList.contains("on")) patchRefresh();
 }
 $("#repo").onchange = () => selectRepo($("#repo").value);
 
@@ -861,7 +866,11 @@ function renderText(el, text, done) {
     const n = document.createElement("span");
     n.className = "muted";
     n.textContent = files.length + " file" + (files.length === 1 ? "" : "s") + ":";
-    bar.append(n, mk("Apply to repo", false), mk("Apply and check", true));
+    const rv = document.createElement("button");
+    rv.type = "button";
+    rv.textContent = "Review patch";
+    rv.onclick = () => showTab("patch");
+    bar.append(n, mk("Apply to repo", false), mk("Apply and check", true), rv);
     el.append(bar);
   }
 }
@@ -875,7 +884,7 @@ async function applyFiles(files, check, btn) {
     const r = await api("/api/apply", { repo: currentRepo, files });
     noteMsg("Applied to " + currentRepo + ":\n" + r.output);
     if (check) await autoChecks(true);
-    else toast("Applied " + r.count + " file(s)");
+    else toast("Applied " + r.count + " file(s). Open the Patch tab to review and zip.");
   } catch (e) {
     noteMsg("Apply failed: " + e.message);
   } finally {
@@ -1244,12 +1253,12 @@ const AUTO = {
   },
 };
 
-async function autoRun(kind) {
+async function autoRun(kind, reqText) {
   if (autoBusy) return;
   if (!currentRepo) { toast("Pick a repo in the Repos tab first"); return; }
   if (ctrl) { toast("Wait for the current chat reply or press Stop"); return; }
   if (!$("#model").value) { toast("No model. Is the tunnel up?"); return; }
-  const req = $("#aReq").value.trim();
+  const req = reqText !== undefined ? reqText : $("#aReq").value.trim();
   if (kind === "feature" && !req) { toast("Describe the feature first"); $("#aReq").focus(); return; }
   if (kind === "bugs" && $("#aRun").checked &&
       !window.confirm("Running tests executes this project's code on your phone. Continue?\nUntick 'run tests' to only check syntax.")) return;
@@ -1274,6 +1283,200 @@ async function autoRun(kind) {
   }
 }
 document.querySelectorAll("#aBtns [data-a]").forEach((b) => { b.onclick = () => autoRun(b.dataset.a); });
+
+// ---------- patch management ----------
+// Ask Qwen -> Apply to repo (Chat) -> review the changed files here -> ZIP with only the ticked
+// files, named after the change -> exact unzip and git commands.
+const pUnchecked = new Set();
+let pFiles = [];
+
+function pSlug(text) {
+  const words = String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+  return words.slice(0, 5).join("-").slice(0, 40);
+}
+function pSelected() { return pFiles.filter((c) => !pUnchecked.has(c.path)).map((c) => c.path); }
+
+function pLoadFields() {
+  $("#pReq").value = store.get("pReq", "");
+  $("#pName").value = store.get("pName", "");
+  $("#pMsg").value = store.get("pMsg", "");
+  $("#pTarget").value = store.get("pTarget:" + currentRepo, "");
+  $("#pDl").value = store.get("pDl", "");
+}
+["pReq", "pName", "pMsg", "pDl"].forEach((id) => { $("#" + id).oninput = () => store.set(id, $("#" + id).value); });
+$("#pTarget").oninput = () => store.set("pTarget:" + currentRepo, $("#pTarget").value);
+
+function pBody(paths) {
+  return {
+    repo: currentRepo, paths,
+    name: $("#pName").value.trim() || pSlug($("#pReq").value) || "changes",
+    request: $("#pReq").value.trim(), message: $("#pMsg").value.trim(),
+    target: $("#pTarget").value.trim(), downloads: $("#pDl").value.trim(),
+  };
+}
+
+async function patchRefresh() {
+  const list = $("#pChanges");
+  pLoadFields();
+  if (!currentRepo) {
+    $("#pLine").textContent = "Pick a repo in the Repos tab first.";
+    list.textContent = "";
+    pFiles = [];
+    return;
+  }
+  try {
+    const j = await api("/api/patch_plan", pBody());
+    $("#pLine").textContent = currentRepo + (j.branch ? "  on " + j.branch : "  (detached HEAD)") + "  " +
+      j.files.length + " changed file" + (j.files.length === 1 ? "" : "s");
+    pFiles = j.files;
+    const keep = new Set(pFiles.map((c) => c.path));
+    Array.from(pUnchecked).forEach((p) => { if (!keep.has(p)) pUnchecked.delete(p); });
+    list.textContent = "";
+    if (!pFiles.length) {
+      const d = document.createElement("div");
+      d.className = "muted";
+      d.style.padding = "8px";
+      d.textContent = "No changes yet. Ask Qwen above and press Apply to repo in the Chat tab.";
+      list.append(d);
+    }
+    pFiles.forEach((c) => {
+      const row = document.createElement("div");
+      row.className = "chg";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !pUnchecked.has(c.path);
+      cb.onchange = () => { if (cb.checked) pUnchecked.delete(c.path); else pUnchecked.add(c.path); };
+      const bd = document.createElement("span");
+      bd.className = "badge b" + (c.code === "?" ? "Q" : c.code);
+      bd.textContent = c.code;
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = c.path + (c.old ? "  (was " + c.old + ")" : "");
+      nm.onclick = () => patchDiff(c);
+      const cnt = document.createElement("span");
+      cnt.className = "cnt";
+      if (c.binary) cnt.textContent = "binary";
+      else if (c.code !== "D") {
+        const a = document.createElement("span");
+        a.className = "a";
+        a.textContent = "+" + c.added;
+        const d = document.createElement("span");
+        d.className = "d";
+        d.textContent = " -" + c.removed;
+        cnt.append(a, d);
+      }
+      row.append(cb, bd, nm, cnt);
+      list.append(row);
+    });
+  } catch (e) {
+    $("#pLine").textContent = e.message;
+  }
+}
+
+async function patchDiff(c) {
+  const v = $("#pView");
+  v.textContent = "";
+  const bar = document.createElement("div");
+  bar.className = "row";
+  const b = document.createElement("b");
+  b.className = "muted";
+  b.textContent = c.path;
+  bar.append(b);
+  v.append(bar);
+  try {
+    const j = await api("/api/filediff?repo=" + enc(currentRepo) + "&path=" + enc(c.path));
+    v.append(diffEl(j.diff.trim() ? j.diff : "(no textual changes)"));
+  } catch (e) {
+    v.append(diffEl(e.message));
+  }
+}
+
+function copyText(t) {
+  if (navigator.clipboard && window.isSecureContext !== false) {
+    return navigator.clipboard.writeText(t).then(() => toast("Copied"), () => copyFallback(t));
+  }
+  copyFallback(t);
+  return Promise.resolve();
+}
+function copyFallback(t) {
+  const ta = document.createElement("textarea");
+  ta.value = t;
+  document.body.append(ta);
+  ta.select();
+  try { document.execCommand("copy"); toast("Copied"); } catch (e) { toast("Select the text and copy it"); }
+  ta.remove();
+}
+
+function patchShowCommands(j, zipSaved) {
+  const out = $("#pOut");
+  out.textContent = "";
+  const note = (t) => {
+    const d = document.createElement("div");
+    d.className = "note";
+    d.textContent = t;
+    out.append(d);
+  };
+  note(j.zip_files
+    ? (zipSaved ? "ZIP downloaded: " : "ZIP name: ") + j.zip + " (" + j.zip_files + " file" + (j.zip_files === 1 ? "" : "s") + ", only the ticked changes)."
+    : "No ZIP needed: only deletions are selected.");
+  if (j.removed.length) note("Deleted or renamed away (removed by git rm): " + j.removed.join(", "));
+  note("Run these in a terminal, one line at a time or all at once. They assume the ZIP is in " + j.downloads +
+    " and your repo is in " + j.target + " (change both under \"Where the files are installed\"). " +
+    "First time in Termux: termux-setup-storage and pkg install unzip git.");
+  const text = j.commands.join("\n");
+  const row = document.createElement("div");
+  row.className = "row";
+  const cp = document.createElement("button");
+  cp.type = "button";
+  cp.textContent = "Copy commands";
+  cp.onclick = () => copyText(text);
+  row.append(cp);
+  const pre = document.createElement("pre");
+  pre.textContent = text;
+  out.append(row, pre);
+  if (out.scrollIntoView) out.scrollIntoView({ block: "nearest" });
+}
+
+async function patchGenerate(withZip) {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  const paths = pSelected();
+  if (!paths.length) { toast("Tick at least one file"); return; }
+  const out = $("#pOut");
+  out.textContent = "working...";
+  try {
+    const j = await api("/api/patch_plan", pBody(paths));
+    let saved = false;
+    if (withZip && j.zip_files) {
+      const r = await fetch("/api/patch_zip", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-PWA": "1" },
+        body: JSON.stringify(pBody(paths)),
+      });
+      if (!r.ok) {
+        let m = r.statusText;
+        try { m = (await r.json()).error || m; } catch (x) { /* ignore */ }
+        throw new Error(m);
+      }
+      saveBlob(j.zip, await r.blob());
+      saved = true;
+    }
+    patchShowCommands(j, saved);
+  } catch (e) {
+    out.textContent = e.message;
+  }
+}
+
+$("#pAsk").onclick = async () => {
+  const req = $("#pReq").value.trim();
+  if (!currentRepo) { toast("Pick a repo in the Repos tab first"); return; }
+  if (!req) { toast("Describe the change first"); $("#pReq").focus(); return; }
+  if (!$("#pName").value.trim()) { $("#pName").value = pSlug(req); store.set("pName", $("#pName").value); }
+  await autoRun("feature", req);
+};
+$("#pRefresh").onclick = () => patchRefresh();
+$("#pAll").onclick = () => { pUnchecked.clear(); patchRefresh(); };
+$("#pNone").onclick = () => { pFiles.forEach((c) => pUnchecked.add(c.path)); patchRefresh(); };
+$("#pZip").onclick = () => patchGenerate(true);
+$("#pCmds").onclick = () => patchGenerate(false);
 
 // ---------- start ----------
 drawHistory();

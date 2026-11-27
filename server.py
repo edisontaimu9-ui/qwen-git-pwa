@@ -12,6 +12,7 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import subprocess
 import sys
 import zipfile
@@ -1410,6 +1411,191 @@ def r_deps(h, q):
     })
 
 
+# ---------- patch management ----------
+PATCH_STAT_LIMIT = 200  # +/- counts are computed for the first files only
+
+
+def patch_slug(name, fallback="changes"):
+    """Safe lowercase file stem for the ZIP, from the change name."""
+    s = re.sub(r"[^a-z0-9._-]+", "-", str(name or "").lower().strip())
+    s = re.sub(r"\.zip$", "", s)
+    s = re.sub(r"-{2,}", "-", s).strip(".-_")[:60].strip(".-_")
+    return s or fallback
+
+
+def clean_line(s, limit):
+    """One line of text without control characters (newlines, tabs, NUL)."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(s or "")).strip()[:limit].strip()
+
+
+def shpath(p):
+    """Quote a path for a shell but keep a leading ~/ working."""
+    p = p.strip()
+    if p == "~" or p == "~/":
+        return "~"
+    if p.startswith("~/"):
+        return "~/" + shlex.quote(p[2:])
+    return shlex.quote(p)
+
+
+def patch_status(root):
+    """Changed files: [{path, code, old}] where code is M A D R C U or ? (untracked)."""
+    toks = git_bytes(["status", "--porcelain", "-z", "-uall"], root).split(b"\0")
+    res = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if len(t) < 4:
+            continue
+        xy = t[:2].decode("ascii", "replace")
+        old = ""
+        if "R" in xy or "C" in xy:
+            src = toks[i] if i < len(toks) else b""
+            i += 1
+            if "R" in xy:
+                old = src.decode("utf-8", "replace")
+        try:
+            path = t[3:].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if xy == "??":
+            code = "?"
+        elif "D" in xy and not os.path.lexists(str(root / path)):
+            code = "D"
+        else:
+            code = xy[0] if xy[0] != " " else xy[1]
+            if code == "D":
+                code = "M"
+        res.append({"path": path, "code": code, "old": old})
+    return sorted(res, key=lambda c: c["path"].lower())
+
+
+def patch_counts(root, c, head):
+    """(lines added, lines removed, is_binary) for one changed file."""
+    if c["code"] == "D":
+        return 0, 0, False
+    if c["code"] == "?" or not head:
+        p = root / c["path"]
+        try:
+            if p.is_symlink() or not p.is_file():
+                return 0, 0, False
+            data = p.read_bytes()[:2_000_000]
+        except OSError:
+            return 0, 0, False
+        if b"\0" in data[:8000]:
+            return 0, 0, True
+        return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0), 0, False
+    out = git_text(["diff", "HEAD", "--numstat", "--no-color", "--", c["path"]], root, ok=(0, 1))
+    for line in out.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        if parts[0] == "-":
+            return 0, 0, True
+        if parts[0].isdigit() and parts[1].isdigit():
+            return int(parts[0]), int(parts[1]), False
+    return 0, 0, False
+
+
+def patch_commands(slug, branch, files, message, target, downloads):
+    """The exact shell commands that install the ZIP and commit it."""
+    adds = [c["path"] for c in files if c["code"] != "D"]
+    removes = []
+    for c in files:
+        if c["code"] == "D":
+            removes.append(c["path"])
+        elif c["old"] and c["old"] != c["path"]:
+            removes.append(c["old"])
+    zip_path = downloads.rstrip("/") + "/" + slug + ".zip"
+    cmds = ["cd " + shpath(target)]
+    if adds:
+        cmds.append("unzip -o " + shpath(zip_path))
+    if removes:
+        cmds.append("git rm -f -q --ignore-unmatch -- " + " ".join(shlex.quote(p) for p in removes))
+    if adds:
+        cmds.append("git add -- " + " ".join(shlex.quote(p) for p in adds))
+    cmds.append("git status --short")
+    cmds.append("git commit -m " + shlex.quote(message))
+    cmds.append("git push -u origin " + shlex.quote(branch) if branch else "git push")
+    return cmds
+
+
+def r_patch_plan(h, q):
+    """POST {repo, name, paths?, message?, request?, target?, downloads?}: review list and commands."""
+    d = h.read_json()
+    repo = d.get("repo")
+    root = repo_path(repo)
+    allc = patch_status(root)
+    if d.get("paths") is not None:
+        want = set(clean_paths(d.get("paths")))
+        chosen = [c for c in allc if c["path"] in want]
+        missing = sorted(want - {c["path"] for c in chosen})
+        if missing:
+            raise ApiError(400, "not a changed file: " + missing[0])
+    else:
+        chosen = allc
+    head = has_head(root)
+    files = []
+    for n, c in enumerate(chosen):
+        added = removed = 0
+        binary = False
+        if n < PATCH_STAT_LIMIT:
+            added, removed, binary = patch_counts(root, c, head)
+        files.append({"path": c["path"], "code": c["code"], "old": c["old"],
+                      "added": added, "removed": removed, "binary": binary})
+    slug = patch_slug(d.get("name"))
+    branch = git_text(["symbolic-ref", "--short", "-q", "HEAD"], root, ok=(0, 1)).strip()
+    message = (clean_line(d.get("message"), 72) or clean_line(d.get("request"), 72)
+               or re.sub(r"[-_]+", " ", slug))
+    target = clean_line(d.get("target"), 300) or "~/batacode-workspace/" + repo
+    downloads = clean_line(d.get("downloads"), 300) or "~/storage/downloads"
+    zip_count = sum(1 for c in files if c["code"] != "D")
+    removes = [c["path"] for c in files if c["code"] == "D"] + [
+        c["old"] for c in files if c["old"] and c["old"] != c["path"]]
+    h.send_json(200, {
+        "name": slug, "zip": slug + ".zip", "branch": branch, "message": message,
+        "target": target, "downloads": downloads,
+        "files": files, "zip_files": zip_count, "removed": removes,
+        "commands": patch_commands(slug, branch, files, message, target, downloads) if files else [],
+    })
+
+
+def r_patch_zip(h, q):
+    """POST {repo, name, paths}: a ZIP with only the ticked changed files (deleted ones cannot be zipped)."""
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    want = set(clean_paths(d.get("paths")))
+    chosen = [c for c in patch_status(root) if c["path"] in want]
+    missing = sorted(want - {c["path"] for c in chosen})
+    if missing:
+        raise ApiError(400, "not a changed file: " + missing[0])
+    buf = io.BytesIO()
+    total = n = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for c in chosen:
+            if c["code"] == "D":
+                continue
+            p = root / c["path"]
+            if p.is_symlink() or not p.is_file():
+                continue
+            total += p.stat().st_size
+            if total > MAX_ZIP_TOTAL:
+                raise ApiError(413, "too large to zip (max 100 MB)")
+            z.write(p, c["path"])
+            n += 1
+    if n == 0:
+        raise ApiError(404, "nothing to zip (only deletions selected)")
+    data = buf.getvalue()
+    h.send_response(200)
+    h.send_header("Content-Type", "application/zip")
+    h.send_header("Content-Disposition", 'attachment; filename="%s.zip"' % patch_slug(d.get("name")))
+    h.send_header("Content-Length", str(len(data)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(data)
+
+
 
 ROUTES = {
     ("GET", "/api/memory"): r_memory_get,
@@ -1448,6 +1634,8 @@ ROUTES = {
     ("POST", "/api/apply"): r_apply,
     ("GET", "/api/review_scan"): r_review_scan,
     ("GET", "/api/deps"): r_deps,
+    ("POST", "/api/patch_plan"): r_patch_plan,
+    ("POST", "/api/patch_zip"): r_patch_zip,
 }
 
 

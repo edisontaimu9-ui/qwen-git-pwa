@@ -18,6 +18,7 @@
     <button data-tab="search">Search</button>
     <button data-tab="git">Git</button>
     <button data-tab="auto">Auto</button>
+    <button data-tab="patch">Patch</button>
   </nav>
   <span id="net">...</span>
 </header>
@@ -186,6 +187,39 @@
       <button type="button" data-a="deps">Check dependencies<small>outdated and incompatible</small></button>
     </div>
     <pre id="aOut"></pre>
+  </section>
+
+  <section id="patch" class="tab">
+    <div id="pLine" class="muted"></div>
+    <b class="muted">1. Ask Qwen for a change</b>
+    <textarea id="pReq" rows="3" placeholder="Describe the change (example: add a logout button to the header). Skip this if you already changed files another way."></textarea>
+    <div class="row">
+      <input id="pName" placeholder="change name (example: add-logout)" autocapitalize="off" autocomplete="off">
+      <button id="pAsk" type="button">Ask Qwen</button>
+    </div>
+    <div class="muted">The reply appears in Chat. Press Apply to repo there, then come back here.</div>
+    <b class="muted">2. Review the changes</b>
+    <div class="row">
+      <button id="pRefresh" type="button">Refresh</button>
+      <button id="pAll" type="button">Select all</button>
+      <button id="pNone" type="button">Select none</button>
+    </div>
+    <div id="pChanges"></div>
+    <div id="pView"></div>
+    <b class="muted">3. ZIP and commands</b>
+    <input id="pMsg" placeholder="commit message (optional, defaults to your description)" autocomplete="off">
+    <details>
+      <summary class="muted">Where the files are installed</summary>
+      <div class="row" style="margin-top:6px">
+        <input id="pTarget" placeholder="repo folder (default ~/batacode-workspace/repo)" autocapitalize="off" autocomplete="off">
+        <input id="pDl" placeholder="download folder (default ~/storage/downloads)" autocapitalize="off" autocomplete="off">
+      </div>
+    </details>
+    <div class="row">
+      <button id="pZip" type="button">Download ZIP and show commands</button>
+      <button id="pCmds" type="button">Commands only</button>
+    </div>
+    <div id="pOut"></div>
   </section>
 </main>
 <div id="toast" hidden></div>

@@ -147,7 +147,6 @@ class EndpointTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown()
         cls.srv.server_close()
-        WS.cleanup()
 
     # 1. project analysis
     def test_analyze(self):
@@ -264,6 +263,140 @@ class EndpointTests(unittest.TestCase):
             server.latest_info = original
         self.assertEqual(code, 200)
         self.assertTrue(j["offline"])
+
+
+def tearDownModule():
+    WS.cleanup()
+
+
+class PatchTests(unittest.TestCase):
+    """Patch management: review list, ZIP of only the chosen changed files, exact commands."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", PORT), server.Handler)
+        cls.srv.daemon_threads = True
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.api = Api()
+        cls.repo = make_repo("patchy", {
+            "app.py": "print('hi')\n",
+            "old.txt": "remove me\n",
+            "keep.txt": "keep\n",
+            "lib/util.py": "X = 1\n",
+            "rename me.txt": "same\n",
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):  # every test starts from the committed state
+        sh(["git", "reset", "--hard", "-q"], self.repo)
+        sh(["git", "clean", "-fdq"], self.repo)
+
+    def dirty(self):
+        """Modify, add, delete and rename files so the tree has one of each kind of change."""
+        (self.repo / "app.py").write_text("print('hi')\nprint('bye')\n")
+        (self.repo / "new_file.py").write_text("a = 1\nb = 2\n")
+        (self.repo / "keep.txt").write_text("changed but not chosen\n")
+        (self.repo / "old.txt").unlink()
+        sh(["git", "mv", "rename me.txt", "renamed.txt"], self.repo)
+
+    def zip_post(self, body):
+        c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+        c.request("POST", "/api/patch_zip", body=json.dumps(body).encode(),
+                  headers={"Host": "127.0.0.1:%d" % PORT, "Content-Type": "application/json", "X-PWA": "1"})
+        r = c.getresponse()
+        data = r.read()
+        head = r.getheader("Content-Disposition", "")
+        c.close()
+        return r.status, data, head
+
+    def test_slug_and_quoting_helpers(self):
+        self.assertEqual(server.patch_slug("Fix Login!! Bug.zip"), "fix-login-bug")
+        self.assertEqual(server.patch_slug("../../etc/passwd"), "etc-passwd")
+        self.assertEqual(server.patch_slug("   "), "changes")
+        self.assertEqual(server.shpath("~/my dir/x"), "~/'my dir/x'")
+        self.assertEqual(server.shpath("/sdcard/Download"), "/sdcard/Download")
+        self.assertEqual(server.clean_line("a\nb\tc", 72), "a b c")
+
+    def test_clean_tree_has_no_files_and_no_commands(self):
+        code, j = self.api.post("/api/patch_plan", {"repo": "patchy", "name": "nothing"})
+        self.assertEqual(code, 200)
+        self.assertEqual(j["files"], [])
+        self.assertEqual(j["commands"], [])
+
+    def test_plan_lists_every_kind_of_change_with_counts(self):
+        self.dirty()
+        code, j = self.api.post("/api/patch_plan", {"repo": "patchy", "name": "x"})
+        self.assertEqual(code, 200)
+        by = {f["path"]: f for f in j["files"]}
+        self.assertEqual(sorted(by), ["app.py", "keep.txt", "new_file.py", "old.txt", "renamed.txt"])
+        self.assertEqual((by["app.py"]["code"], by["app.py"]["added"], by["app.py"]["removed"]), ("M", 1, 0))
+        self.assertEqual((by["new_file.py"]["code"], by["new_file.py"]["added"]), ("?", 2))
+        self.assertEqual(by["old.txt"]["code"], "D")
+        self.assertEqual((by["renamed.txt"]["code"], by["renamed.txt"]["old"]), ("R", "rename me.txt"))
+
+    def test_commands_for_the_chosen_files(self):
+        self.dirty()
+        code, j = self.api.post("/api/patch_plan", {
+            "repo": "patchy", "name": "Add Bye Line", "message": "Add bye line",
+            "paths": ["app.py", "new_file.py", "old.txt", "renamed.txt"],
+            "target": "~/work/my repo", "downloads": "/sdcard/Download"})
+        self.assertEqual(code, 200)
+        self.assertEqual(j["zip"], "add-bye-line.zip")
+        self.assertEqual(j["zip_files"], 3)
+        self.assertEqual(sorted(j["removed"]), ["old.txt", "rename me.txt"])
+        self.assertEqual(j["commands"], [
+            "cd ~/'work/my repo'",
+            "unzip -o /sdcard/Download/add-bye-line.zip",
+            "git rm -f -q --ignore-unmatch -- old.txt 'rename me.txt'",
+            "git add -- app.py new_file.py renamed.txt",
+            "git status --short",
+            "git commit -m 'Add bye line'",
+            "git push -u origin main",
+        ])
+        self.assertNotIn("keep.txt", " ".join(j["commands"]))  # changed on disk but not chosen
+
+    def test_defaults_when_target_and_message_are_empty(self):
+        self.dirty()
+        code, j = self.api.post("/api/patch_plan", {"repo": "patchy", "name": "fix-login", "paths": ["app.py"]})
+        self.assertEqual(j["commands"][0], "cd ~/batacode-workspace/patchy")
+        self.assertEqual(j["commands"][1], "unzip -o ~/storage/downloads/fix-login.zip")
+        self.assertEqual(j["message"], "fix login")
+
+    def test_zip_has_only_chosen_changed_files_and_uses_the_change_name(self):
+        self.dirty()
+        status, data, head = self.zip_post({"repo": "patchy", "name": "Add Bye Line",
+                                            "paths": ["app.py", "new_file.py", "old.txt"]})
+        self.assertEqual(status, 200)
+        self.assertIn('filename="add-bye-line.zip"', head)
+        import io
+        import zipfile
+        z = zipfile.ZipFile(io.BytesIO(data))
+        self.assertEqual(sorted(z.namelist()), ["app.py", "new_file.py"])  # no deleted, unchosen or unchanged files
+        self.assertEqual(z.read("app.py"), b"print('hi')\nprint('bye')\n")
+
+    def test_rejections(self):
+        self.dirty()
+        self.assertEqual(self.zip_post({"repo": "patchy", "name": "x", "paths": ["lib/util.py"]})[0], 400)  # unchanged
+        self.assertEqual(self.zip_post({"repo": "patchy", "name": "x", "paths": ["../x"]})[0], 400)
+        self.assertEqual(self.zip_post({"repo": "patchy", "name": "x", "paths": ["old.txt"]})[0], 404)  # deletion only
+        self.assertEqual(self.api.post("/api/patch_plan", {"repo": "patchy", "paths": []})[0], 400)
+        self.assertEqual(self.api.post("/api/patch_plan", {"repo": "nope"})[0], 404)
+
+    def test_hostile_input_cannot_add_commands(self):
+        self.dirty()
+        code, j = self.api.post("/api/patch_plan", {
+            "repo": "patchy", "name": "x", "paths": ["app.py"],
+            "message": "it's ok\nrm -rf ~", "target": "/tmp/a\nrm -rf /", "downloads": "/d; rm -rf /"})
+        self.assertEqual(code, 200)
+        for c in j["commands"]:
+            self.assertNotIn("\n", c)
+        self.assertEqual(j["commands"][0], "cd '/tmp/a rm -rf /'")
+        self.assertEqual(j["commands"][1], "unzip -o '/d; rm -rf /x.zip'")
+        self.assertEqual(j["commands"][-2], "git commit -m 'it'\"'\"'s ok rm -rf ~'")
 
 
 if __name__ == "__main__":

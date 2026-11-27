@@ -81,3 +81,14 @@ header { flex-wrap: wrap; gap: 4px; }
 #aOut { flex: 1 0 120px; margin: 0; padding: 8px; overflow: auto; background: #0a0c11; border-radius: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
 .applybar { margin: 6px 0; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .applybar button { background: #1f6b3a; border-color: #2c8f4f; }
+#patch { overflow-y: auto; }
+#pChanges { max-height: 30vh; overflow: auto; border: 1px solid #2c3242; border-radius: 8px; flex: 0 0 auto; }
+#pView { flex: 0 0 auto; max-height: 40vh; overflow: auto; }
+#pView pre, #pOut pre { margin: 0; padding: 8px; background: #0a0c11; border-radius: 8px; font-size: 12px; white-space: pre; overflow: auto; }
+#pView .row { margin-bottom: 6px; align-items: center; }
+#pOut { flex: 0 0 auto; padding-bottom: 12px; }
+#pOut .row { margin: 6px 0; align-items: center; }
+#pOut .note { color: #9fb0d0; font-size: 13px; margin: 6px 0; }
+.chg .cnt { font: 12px ui-monospace, monospace; flex: 0 0 auto; white-space: nowrap; }
+.cnt .a { color: #6bd68a; } .cnt .d { color: #ff7a7a; }
+details summary { cursor: pointer; }

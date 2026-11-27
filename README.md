@@ -34,6 +34,28 @@ The Git tab works on the selected repo.
 - Project: on sends the repo file list and git status with every message, which helps with debugging a whole project.
 - When the model writes a file it labels it `File: path`, so Save to repo and Download pre-fill the right name.
 
+## Patch management (Patch tab)
+
+The whole change workflow in one place, built for a phone:
+
+1. Choose an existing repo (the repo menu in Chat, or the Repos tab).
+2. Describe the change in the Patch tab and press Ask Qwen. The reply streams into Chat as a plan plus complete files.
+3. Review: press Apply to repo under the reply (or Review patch). Back in the Patch tab every changed file is listed with `+added -removed` line counts. Tap a file for its colored diff and untick anything that should not be part of the patch.
+4. Press Download ZIP and show commands. The ZIP holds only the ticked changed files (paths kept), named after the change: `add-logout` gives `add-logout.zip`. Deleted files cannot be zipped, so they are removed by a `git rm` line instead, and renamed files are handled the same way.
+5. The exact commands appear with a Copy button, for example:
+
+        cd ~/batacode-workspace/demo
+        unzip -o ~/storage/downloads/add-logout.zip
+        git rm -f -q --ignore-unmatch -- old.txt
+        git add -- app.py header.js
+        git status --short
+        git commit -m 'Add logout button'
+        git push -u origin main
+
+Under "Where the files are installed" you can set the repo folder and the download folder on the machine where you install (the defaults are `~/batacode-workspace/<repo>` and `~/storage/downloads`; in Termux run `termux-setup-storage` and `pkg install unzip git` once). The commit message defaults to your description. File names are shell-quoted, so unusual names are safe to paste.
+
+Commands only shows the commands without downloading. You can also use the Patch tab without Qwen: edit files yourself, then review and zip them.
+
 ## Memory
 
 Lightweight and optional: a single small JSON file, `~/batacode-workspace/.batacode-memory.json` (max 50 notes, 300 characters each). Notes are sent to the model with every message.
@@ -67,7 +89,7 @@ Big prompts only stay in the model's context until the next Auto action, and onl
 
     python3 -m unittest discover -s tests -v
 
-Covers the automation tools (version-range logic, scanner rules, checks, file selection, apply safety, dependency analysis with a fake registry). No network or Ollama needed.
+Covers the automation tools (version-range logic, scanner rules, checks, file selection, apply safety, dependency analysis with a fake registry) and patch management (change review, ZIP contents, generated commands, hostile input). No network or Ollama needed.
 
 ## Notes
 
