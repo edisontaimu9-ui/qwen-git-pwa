@@ -27,6 +27,21 @@
       <input id="chatFile" type="file" multiple hidden>
       <button id="newChat" type="button">New</button>
     </div>
+    <div id="quick" class="bar">
+      <button type="button" data-q="explain">Explain</button>
+      <button type="button" data-q="error">Fix error</button>
+      <button type="button" data-q="refactor">Refactor</button>
+      <button type="button" data-q="optimise">Optimise</button>
+      <button type="button" data-q="newfile">New file</button>
+      <button type="button" id="diffBtn">Add diff</button>
+      <button type="button" id="projBtn">Project: off</button>
+      <select id="ctx" title="Context size">
+        <option value="4096">4k ctx</option>
+        <option value="8192">8k ctx</option>
+        <option value="16384">16k ctx</option>
+        <option value="32768">32k ctx</option>
+      </select>
+    </div>
     <div id="chips"></div>
     <div id="files" hidden></div>
     <div id="msgs"></div>

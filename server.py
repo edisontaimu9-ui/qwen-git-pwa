@@ -364,6 +364,24 @@ def r_upload(h, q):
     h.send_json(200, {"ok": True, "output": "%s: saved (%d bytes)" % (name, len(data))})
 
 
+def r_context(h, q):
+    root = repo_path(q.get("repo"))
+    out = git_bytes(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root)
+    names = []
+    for t in out.split(b"\0"):
+        if t:
+            try:
+                names.append(t.decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+    st = git(["status", "-sb"], root, 20)
+    h.send_json(200, {
+        "tree": "\n".join(names[:300]),
+        "more": max(0, len(names) - 300),
+        "status": st["output"],
+    })
+
+
 ROUTES = {
     ("GET", "/api/tags"): r_tags,
     ("POST", "/api/chat"): r_chat,
@@ -379,6 +397,7 @@ ROUTES = {
     ("GET", "/api/file"): r_file_get,
     ("POST", "/api/file"): r_file_post,
     ("GET", "/api/zip"): r_zip,
+    ("GET", "/api/context"): r_context,
     ("POST", "/api/upload"): r_upload,
 }
 

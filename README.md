@@ -10,6 +10,13 @@ Nothing is installed or hosted on the server except the existing tunnel to Ollam
 
 Open http://localhost:8787 in Chrome. Use "Add to Home screen" to install.
 
+## AI coding assistant
+
+- Chat with the Qwen model on your server. The conversation is kept between sessions (last 40 messages) and the context size is set with the ctx menu (default 8k).
+- Quick actions fill the prompt: Explain, Fix error, Refactor, Optimise, New file. Attach files or press Add diff to give the model your code.
+- Project: on sends the repo file list and git status with every message, which helps with debugging a whole project.
+- When the model writes a file it labels it `File: path`, so Save to repo and Download pre-fill the right name.
+
 ## In the chat
 
 - Clone: type `clone https://github.com/owner/repo.git` (optional folder name after the URL). The repo is cloned and selected.

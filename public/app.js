@@ -205,6 +205,52 @@ $("#attachBtn").onclick = () => {
   if (!box.hidden) { attachPath = ""; renderFiles(); }
 };
 
+// ---------- assistant tools ----------
+const TEMPLATES = {
+  explain: "Explain what this code does, step by step:",
+  error: "Explain this error, find the cause, and show the fix:",
+  refactor: "Refactor the attached code for readability without changing behavior. Show the full updated file(s).",
+  optimise: "Optimise the attached code for speed and memory. Show the full updated file(s) and explain each change briefly.",
+  newfile: "Write a complete file that does this:",
+};
+document.querySelectorAll("#quick [data-q]").forEach((b) => {
+  b.onclick = () => {
+    const i = $("#input");
+    i.value = TEMPLATES[b.dataset.q] + (i.value ? "\n" + i.value : "");
+    i.focus();
+  };
+});
+
+$("#diffBtn").onclick = async () => {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  try {
+    const r = await api("/api/diff?repo=" + encodeURIComponent(currentRepo));
+    if (!r.output || !r.output.trim()) { toast("No changes to attach"); return; }
+    if (!attachments.some((a) => a.path === "git diff")) attachments.push({ path: "git diff", content: r.output });
+    renderChips();
+  } catch (e) { toast(e.message); }
+};
+
+function syncProj() {
+  const on = store.get("proj", false);
+  $("#projBtn").textContent = "Project: " + (on ? "on" : "off");
+  $("#projBtn").classList.toggle("on", on);
+}
+$("#projBtn").onclick = () => { store.set("proj", !store.get("proj", false)); syncProj(); };
+syncProj();
+
+$("#ctx").value = String(store.get("ctx", 8192));
+$("#ctx").onchange = () => store.set("ctx", Number($("#ctx").value));
+
+async function projectContext() {
+  if (!store.get("proj", false) || !currentRepo) return "";
+  try {
+    const j = await api("/api/context?repo=" + encodeURIComponent(currentRepo));
+    return "Project context for repo " + currentRepo + ".\nGit status:\n" + j.status.trim() +
+      "\nFiles:\n" + j.tree + (j.more ? "\n... and " + j.more + " more files" : "");
+  } catch (e) { return ""; }
+}
+
 // ---------- downloads ----------
 const EXT = { python: "py", py: "py", javascript: "js", js: "js", typescript: "ts", ts: "ts", html: "html",
   css: "css", json: "json", bash: "sh", sh: "sh", shell: "sh", markdown: "md", md: "md", yaml: "yml",
@@ -220,8 +266,8 @@ function saveBlob(name, blob) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
-function downloadBlock(code, lang) {
-  const name = window.prompt("File name to download", "file." + (EXT[lang] || "txt"));
+function downloadBlock(code, lang, def) {
+  const name = window.prompt("File name to download", def ? def.split("/").pop() : "file." + (EXT[lang] || "txt"));
   if (!name || !name.trim()) return;
   saveBlob(name.trim().split("/").pop(), new Blob([code + "\n"], { type: "text/plain" }));
 }
@@ -323,19 +369,23 @@ async function chatClone(shown, url, name) {
 }
 
 // ---------- chat ----------
-const SYSTEM = "You are a concise coding assistant. When you give code for a file, put it in a fenced code block.";
+const SYSTEM = "You are a coding assistant running on the user's own server. Explain code and errors clearly, write functions and complete files, debug, refactor and optimise. Be concise. For every file you write, put a line \"File: path/to/file\" right before its fenced code block, give the complete file contents unless a snippet is asked for, and tag the block with its language. If you need a file you cannot see, ask for it.";
 let history = store.get("hist", []);
 let ctrl = null;
 
 function renderText(el, text) {
   el.textContent = "";
+  let prev = "";
   text.split("```").forEach((part, i) => {
     if (i % 2 === 0) {
+      prev = part;
       if (part) { const s = document.createElement("span"); s.textContent = part; el.append(s); }
       return;
     }
     const nl = part.indexOf("\n");
     const lang = nl >= 0 ? part.slice(0, nl).trim().toLowerCase() : "";
+    const fm = prev.trimEnd().split("\n").pop().match(/(?:File|Path):\s*[`*]*([^\s`*]+)/i);
+    const fpath = fm ? fm[1] : "";
     let code = nl >= 0 ? part.slice(nl + 1) : "";
     code = code.replace(/\n$/, "");
     const wrap = document.createElement("div");
@@ -345,19 +395,19 @@ function renderText(el, text) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.textContent = "Save to repo";
-    btn.onclick = () => saveBlock(code);
+    btn.onclick = () => saveBlock(code, fpath);
     const dl = document.createElement("button");
     dl.type = "button";
     dl.textContent = "Download";
-    dl.onclick = () => downloadBlock(code, lang);
+    dl.onclick = () => downloadBlock(code, lang, fpath);
     wrap.append(pre, btn, dl);
     el.append(wrap);
   });
 }
 
-async function saveBlock(code) {
+async function saveBlock(code, def) {
   if (!currentRepo) { toast("Pick a repo first"); return; }
-  const path = prompt("Save to path in " + currentRepo + " (example: src/app.py)");
+  const path = prompt("Save to path in " + currentRepo + " (example: src/app.py)", def || "");
   if (!path) return;
   try {
     await api("/api/file", { repo: currentRepo, path: path.trim(), content: code + "\n" });
@@ -417,11 +467,14 @@ $("#composer").onsubmit = async (e) => {
   ctrl = new AbortController();
   setBusy(true);
   try {
-    const messages = [{ role: "system", content: SYSTEM }].concat(history.filter((m) => !m.local).map((m) => ({ role: m.role, content: m.content })));
+    const messages = [{ role: "system", content: SYSTEM }];
+    const pc = await projectContext();
+    if (pc) messages.push({ role: "system", content: pc });
+    history.filter((m) => !m.local).forEach((m) => messages.push({ role: m.role, content: m.content }));
     const r = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-PWA": "1" },
-      body: JSON.stringify({ model, messages, stream: true }),
+      body: JSON.stringify({ model, messages, stream: true, options: { num_ctx: Number($("#ctx").value) || 8192 } }),
       signal: ctrl.signal,
     });
     if (!r.ok) {
