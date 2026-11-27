@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = int(os.environ.get("PWA_PORT", "8787"))
 OLLAMA = urlparse(os.environ.get("OLLAMA_URL", "http://localhost:11434"))
-WORKSPACE = Path(os.environ.get("PWA_WORKSPACE", str(Path.home() / "qwen-workspace"))).resolve()
+WORKSPACE = Path(os.environ.get("PWA_WORKSPACE", str(Path.home() / "batacode-workspace"))).resolve()
 PUBLIC = (Path(__file__).parent / "public").resolve()
 ALLOWED_HOSTS = {"localhost:%d" % PORT, "127.0.0.1:%d" % PORT}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
