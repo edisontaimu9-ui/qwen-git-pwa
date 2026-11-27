@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local backend for the Qwen Git PWA. Python stdlib only.
+"""Local backend for BataCode. Python stdlib only.
 
 Serves ./public, proxies chat to Ollama, and runs git inside a workspace
 folder. Binds to 127.0.0.1 only.
@@ -255,7 +255,7 @@ def proxy(h, method, path, body):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "qwen-git-pwa"
+    server_version = "batacode"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
@@ -344,7 +344,7 @@ def main():
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     srv.daemon_threads = True
-    print("Qwen Git PWA: http://localhost:%d" % PORT)
+    print("BataCode: http://localhost:%d" % PORT)
     print("Workspace:    %s" % WORKSPACE)
     print("Ollama:       %s" % OLLAMA.geturl())
     try:

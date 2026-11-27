@@ -1,4 +1,4 @@
-const CACHE = "qwen-git-v1";
+const CACHE = "batacode-v1";
 const SHELL = ["/", "/app.js", "/style.css", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (e) => {

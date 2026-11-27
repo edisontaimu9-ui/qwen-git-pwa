@@ -1,4 +1,4 @@
-# Qwen Git PWA
+# BataCode
 
 Phone-only app. Chat with Qwen on the server (through an SSH tunnel) and use git on repos in `~/qwen-workspace`.
 
