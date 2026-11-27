@@ -205,6 +205,123 @@ $("#attachBtn").onclick = () => {
   if (!box.hidden) { attachPath = ""; renderFiles(); }
 };
 
+// ---------- downloads ----------
+const EXT = { python: "py", py: "py", javascript: "js", js: "js", typescript: "ts", ts: "ts", html: "html",
+  css: "css", json: "json", bash: "sh", sh: "sh", shell: "sh", markdown: "md", md: "md", yaml: "yml",
+  yml: "yml", java: "java", c: "c", cpp: "cpp", go: "go", rust: "rs", rs: "rs", ruby: "rb", php: "php", sql: "sql" };
+
+function saveBlob(name, blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+function downloadBlock(code, lang) {
+  const name = window.prompt("File name to download", "file." + (EXT[lang] || "txt"));
+  if (!name || !name.trim()) return;
+  saveBlob(name.trim().split("/").pop(), new Blob([code + "\n"], { type: "text/plain" }));
+}
+
+async function downloadZip(changed) {
+  if (!currentRepo) return;
+  let name = currentRepo;
+  if (changed) {
+    const n = window.prompt("Name this change (example: fix-login)", "changes");
+    if (!n || !n.trim()) return;
+    name = n.trim();
+  }
+  const url = "/api/zip?repo=" + encodeURIComponent(currentRepo) + (changed ? "&changed=1" : "") +
+    "&name=" + encodeURIComponent(name);
+  $("#out").textContent = "zipping...";
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      let m = r.statusText;
+      try { m = (await r.json()).error || m; } catch (x) { /* ignore */ }
+      throw new Error(m);
+    }
+    const mt = (r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/);
+    const fname = mt ? mt[1] : name + ".zip";
+    saveBlob(fname, await r.blob());
+    $("#out").textContent = "Downloaded " + fname;
+  } catch (e) {
+    $("#out").textContent = e.message;
+  }
+}
+$("#dlRepo").onclick = () => downloadZip(false);
+$("#dlChanged").onclick = () => downloadZip(true);
+
+// ---------- uploads ----------
+function readB64(file) {
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(String(fr.result).split(",")[1] || "");
+    fr.onerror = () => rej(new Error("read failed"));
+    fr.readAsDataURL(file);
+  });
+}
+
+// device files into the repo (zips can be extracted)
+$("#upBtn").onclick = () => {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  $("#upFile").click();
+};
+$("#upFile").onchange = async () => {
+  const files = Array.from($("#upFile").files);
+  $("#upFile").value = "";
+  const dir = $("#upDir").value.trim();
+  const lines = [];
+  for (const f of files) {
+    if (f.size > 15000000) { lines.push(f.name + ": too large (max 15 MB)"); continue; }
+    const extract = /\.zip$/i.test(f.name) &&
+      window.confirm("Extract " + f.name + " into the repo?\nCancel saves it as a zip file.");
+    $("#out").textContent = "uploading " + f.name + "...";
+    try {
+      const r = await api("/api/upload", { repo: currentRepo, dir, name: f.name, data: await readB64(f), extract });
+      lines.push(r.output);
+    } catch (e) {
+      lines.push(f.name + ": " + e.message);
+    }
+  }
+  $("#out").textContent = lines.join("\n");
+};
+
+// device text files into the chat as context
+$("#chatUp").onclick = () => $("#chatFile").click();
+$("#chatFile").onchange = async () => {
+  const files = Array.from($("#chatFile").files);
+  $("#chatFile").value = "";
+  for (const f of files) {
+    if (f.size > 300000) { toast(f.name + " is too large (max 300 KB)"); continue; }
+    const text = await f.text();
+    if (text.includes("\u0000")) { toast(f.name + " is not a text file"); continue; }
+    if (!attachments.some((a) => a.path === f.name)) attachments.push({ path: f.name, content: text });
+  }
+  renderChips();
+};
+
+// ---------- clone from chat ----------
+async function chatClone(shown, url, name) {
+  history.push({ role: "user", content: shown, shown, local: true });
+  addMsg("user", shown);
+  const el = addMsg("assistant", "cloning...", true);
+  let text;
+  try {
+    const r = await api("/api/clone", { url, name });
+    text = (r.ok ? "Cloned " + r.name + " and selected it.\n" : "Clone failed.\n") + (r.output || "").trim();
+    if (r.ok) selectRepo(r.name);
+  } catch (e) {
+    text = "Clone failed: " + e.message;
+  }
+  renderText(el, text);
+  history.push({ role: "assistant", content: text, local: true });
+  store.set("hist", history);
+}
+
 // ---------- chat ----------
 const SYSTEM = "You are a concise coding assistant. When you give code for a file, put it in a fenced code block.";
 let history = store.get("hist", []);
@@ -218,6 +335,7 @@ function renderText(el, text) {
       return;
     }
     const nl = part.indexOf("\n");
+    const lang = nl >= 0 ? part.slice(0, nl).trim().toLowerCase() : "";
     let code = nl >= 0 ? part.slice(nl + 1) : "";
     code = code.replace(/\n$/, "");
     const wrap = document.createElement("div");
@@ -228,7 +346,11 @@ function renderText(el, text) {
     btn.type = "button";
     btn.textContent = "Save to repo";
     btn.onclick = () => saveBlock(code);
-    wrap.append(pre, btn);
+    const dl = document.createElement("button");
+    dl.type = "button";
+    dl.textContent = "Download";
+    dl.onclick = () => downloadBlock(code, lang);
+    wrap.append(pre, btn, dl);
     el.append(wrap);
   });
 }
@@ -243,9 +365,9 @@ async function saveBlock(code) {
   } catch (e) { toast(e.message); }
 }
 
-function addMsg(role, text) {
+function addMsg(role, text, note) {
   const d = document.createElement("div");
-  d.className = "msg " + role;
+  d.className = "msg " + role + (note ? " note" : "");
   if (role === "assistant") renderText(d, text); else d.textContent = text;
   $("#msgs").append(d);
   $("#msgs").scrollTop = $("#msgs").scrollHeight;
@@ -254,7 +376,7 @@ function addMsg(role, text) {
 
 function drawHistory() {
   $("#msgs").textContent = "";
-  history.forEach((m) => addMsg(m.role, m.shown || m.content));
+  history.forEach((m) => addMsg(m.role, m.shown || m.content, m.local));
 }
 
 $("#newChat").onclick = () => {
@@ -277,6 +399,8 @@ $("#composer").onsubmit = async (e) => {
   const prompt = $("#input").value.trim();
   const model = $("#model").value;
   if (!prompt) return;
+  const cm = prompt.match(/^\/?clone\s+(\S+)(?:\s+(\S+))?$/i);
+  if (cm) { $("#input").value = ""; await chatClone(prompt, cm[1], cm[2] || ""); return; }
   if (!model) { toast("No model. Is the tunnel up?"); return; }
   let content = prompt;
   let shown = prompt;
@@ -293,7 +417,7 @@ $("#composer").onsubmit = async (e) => {
   ctrl = new AbortController();
   setBusy(true);
   try {
-    const messages = [{ role: "system", content: SYSTEM }].concat(history.map((m) => ({ role: m.role, content: m.content })));
+    const messages = [{ role: "system", content: SYSTEM }].concat(history.filter((m) => !m.local).map((m) => ({ role: m.role, content: m.content })));
     const r = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-PWA": "1" },

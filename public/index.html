@@ -23,6 +23,8 @@
       <select id="model"></select>
       <select id="repo"><option value="">no repo</option></select>
       <button id="attachBtn" type="button">Attach</button>
+      <button id="chatUp" type="button">Upload</button>
+      <input id="chatFile" type="file" multiple hidden>
       <button id="newChat" type="button">New</button>
     </div>
     <div id="chips"></div>
@@ -48,6 +50,15 @@
         <button data-act="diff" type="button">Diff</button>
         <button data-act="pull" type="button">Pull</button>
         <button data-act="push" type="button">Push</button>
+      </div>
+      <div class="row">
+        <button id="dlRepo" type="button">Download repo</button>
+        <button id="dlChanged" type="button">Download changes</button>
+      </div>
+      <div class="row">
+        <input id="upDir" placeholder="folder in repo (optional)" autocapitalize="off" autocomplete="off">
+        <button id="upBtn" type="button">Upload files</button>
+        <input id="upFile" type="file" multiple hidden>
       </div>
       <form id="commitForm" class="row">
         <input id="commitMsg" placeholder="commit message" autocomplete="off">

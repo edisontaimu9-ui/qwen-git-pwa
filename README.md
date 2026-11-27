@@ -10,6 +10,12 @@ Nothing is installed or hosted on the server except the existing tunnel to Ollam
 
 Open http://localhost:8787 in Chrome. Use "Add to Home screen" to install.
 
+## In the chat
+
+- Clone: type `clone https://github.com/owner/repo.git` (optional folder name after the URL). The repo is cloned and selected.
+- Download: every code block has a Download button. The Repos tab has Download repo (all files, no `.git`) and Download changes (only changed and new files, named after the change you type, for example `fix-login.zip`).
+- Upload: the Upload button in the chat adds text files from your phone as context. In the Repos tab, Upload files saves files into the repo (optional folder), and zip files can be extracted into it.
+
 ## Notes
 
 - Binds to 127.0.0.1 only. Rejects other Host and Origin headers.

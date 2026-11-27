@@ -4,13 +4,17 @@
 Serves ./public, proxies chat to Ollama, and runs git inside a workspace
 folder. Binds to 127.0.0.1 only.
 """
+import base64
+import binascii
 import http.client
+import io
 import json
 import mimetypes
 import os
 import re
 import subprocess
 import sys
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +29,10 @@ URL_RE = re.compile(r"^(https://[^\s/]+/[^\s]+|git@[A-Za-z0-9.-]+:[^\s]+)$")
 MAX_BODY = 3_000_000
 MAX_FILE = 300_000
 MAX_OUT = 60_000
+MAX_UPLOAD = 21_000_000        # request body (base64) for /api/upload
+MAX_UPLOAD_FILE = 15_000_000   # decoded size of one uploaded file
+MAX_ZIP_TOTAL = 100_000_000    # max bytes zipped or unzipped in one go
+MAX_ZIP_FILES = 5000
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 
@@ -38,14 +46,18 @@ class ApiError(Exception):
 
 # ---------- git helpers ----------
 
-def git(args, cwd, timeout=300):
-    env = dict(
+def git_env():
+    return dict(
         os.environ,
         GIT_TERMINAL_PROMPT="0",
         GIT_ALLOW_PROTOCOL="https:ssh",
         GIT_SSH_COMMAND="ssh -o BatchMode=yes",
         LC_ALL="C",
     )
+
+
+def git(args, cwd, timeout=300):
+    env = git_env()
     try:
         p = subprocess.run(["git"] + args, cwd=str(cwd), env=env,
                            capture_output=True, text=True, timeout=timeout)
@@ -55,6 +67,18 @@ def git(args, cwd, timeout=300):
     if len(out) > MAX_OUT:
         out = out[:MAX_OUT] + "\n[truncated]"
     return {"ok": p.returncode == 0, "output": out}
+
+
+def git_bytes(args, cwd, timeout=60):
+    """Run git and return raw stdout bytes (for -z output)."""
+    try:
+        p = subprocess.run(["git"] + args, cwd=str(cwd), env=git_env(),
+                           capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ApiError(504, "git timed out")
+    if p.returncode != 0:
+        raise ApiError(500, "git failed: " + p.stderr.decode("utf-8", "replace")[:200])
+    return p.stdout
 
 
 def repo_path(name):
@@ -118,7 +142,9 @@ def r_clone(h, q):
     if dest.exists():
         raise ApiError(409, "folder already exists")
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    h.send_json(200, git(["clone", "--", url, name], WORKSPACE, 900))
+    res = git(["clone", "--", url, name], WORKSPACE, 900)
+    res["name"] = name
+    h.send_json(200, res)
 
 
 def r_status(h, q):
@@ -209,6 +235,135 @@ def r_file_post(h, q):
     h.send_json(200, {"ok": True})
 
 
+def zip_files(root, changed):
+    """Relative paths to zip: changed files only, or every non-ignored file."""
+    seen = {}
+    if changed:
+        out = git_bytes(["status", "--porcelain", "-z", "-uall"], root)
+        toks = out.split(b"\0")
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            i += 1
+            if len(t) < 4:
+                continue
+            xy = t[:2].decode("ascii", "replace")
+            if "R" in xy or "C" in xy:
+                i += 1  # skip the original path of a rename or copy
+            if "D" in xy:
+                continue
+            try:
+                seen[t[3:].decode("utf-8")] = True
+            except UnicodeDecodeError:
+                pass
+    else:
+        out = git_bytes(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root)
+        for t in out.split(b"\0"):
+            if not t:
+                continue
+            try:
+                seen[t.decode("utf-8")] = True
+            except UnicodeDecodeError:
+                pass
+    return list(seen)
+
+
+def r_zip(h, q):
+    root = repo_path(q.get("repo"))
+    changed = q.get("changed") == "1"
+    files = zip_files(root, changed)
+    buf = io.BytesIO()
+    total = n = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel in files:
+            p = root / rel
+            if p.is_symlink() or not p.is_file():
+                continue
+            total += p.stat().st_size
+            if total > MAX_ZIP_TOTAL:
+                raise ApiError(413, "too large to zip (max 100 MB)")
+            z.write(p, rel)
+            n += 1
+    if n == 0:
+        raise ApiError(404, "no changed files" if changed else "no files")
+    base = re.sub(r"[^A-Za-z0-9._-]", "", q.get("name", "")) or (
+        q.get("repo") + ("-changes" if changed else ""))
+    base = re.sub(r"\.zip$", "", base, flags=re.I).lstrip(".-") or "download"
+    data = buf.getvalue()
+    h.send_response(200)
+    h.send_header("Content-Type", "application/zip")
+    h.send_header("Content-Disposition", 'attachment; filename="%s.zip"' % base)
+    h.send_header("Content-Length", str(len(data)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(data)
+
+
+def extract_zip(data, root, dest_rel):
+    dest = safe_join(root, dest_rel, allow_root=True)
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ApiError(400, "not a valid zip file")
+    done = skipped = 0
+    with z:
+        infos = [i for i in z.infolist() if not i.is_dir()]
+        if len(infos) > MAX_ZIP_FILES:
+            raise ApiError(413, "too many files in zip")
+        if sum(i.file_size for i in infos) > MAX_ZIP_TOTAL:
+            raise ApiError(413, "zip is too large when unpacked")
+        for i in infos:
+            name = i.filename.replace("\\", "/")
+            if name.startswith("__MACOSX/") or name.endswith(".DS_Store"):
+                skipped += 1
+                continue
+            rel = (dest_rel + "/" + name) if dest_rel else name
+            try:
+                p = safe_join(root, rel)
+                if p != dest and dest not in p.parents:
+                    raise ApiError(400, "outside target folder")
+                if p.is_dir():
+                    raise ApiError(400, "is a directory")
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(z.read(i))
+                done += 1
+            except (ApiError, OSError):
+                skipped += 1
+    return done, skipped
+
+
+def r_upload(h, q):
+    d = h.read_json(MAX_UPLOAD)
+    root = repo_path(d.get("repo"))
+    name = str(d.get("name", "")).strip()
+    if (not name or "/" in name or "\\" in name or "\x00" in name
+            or name in (".", "..") or name == ".git"):
+        raise ApiError(400, "bad file name")
+    dest = safe_join(root, str(d.get("dir", "")).strip().strip("/"), allow_root=True)
+    if dest.exists() and not dest.is_dir():
+        raise ApiError(400, "target folder is a file")
+    try:
+        data = base64.b64decode(str(d.get("data", "")), validate=True)
+    except (binascii.Error, ValueError):
+        raise ApiError(400, "bad file data")
+    if len(data) > MAX_UPLOAD_FILE:
+        raise ApiError(413, "file too large (max 15 MB)")
+    dest_rel = "" if dest == root else dest.relative_to(root).as_posix()
+    if d.get("extract") and name.lower().endswith(".zip"):
+        done, skipped = extract_zip(data, root, dest_rel)
+        msg = "%s: extracted %d file(s)" % (name, done)
+        if skipped:
+            msg += ", skipped %d" % skipped
+        h.send_json(200, {"ok": True, "output": msg})
+        return
+    p = safe_join(root, (dest_rel + "/" + name) if dest_rel else name)
+    if p.is_dir():
+        raise ApiError(400, "a folder with that name exists")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    h.send_json(200, {"ok": True, "output": "%s: saved (%d bytes)" % (name, len(data))})
+
+
 ROUTES = {
     ("GET", "/api/tags"): r_tags,
     ("POST", "/api/chat"): r_chat,
@@ -223,6 +378,8 @@ ROUTES = {
     ("GET", "/api/files"): r_files,
     ("GET", "/api/file"): r_file_get,
     ("POST", "/api/file"): r_file_post,
+    ("GET", "/api/zip"): r_zip,
+    ("POST", "/api/upload"): r_upload,
 }
 
 
@@ -272,9 +429,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def read_json(self):
+    def read_json(self, limit=MAX_BODY):
         n = int(self.headers.get("Content-Length") or 0)
-        if n > MAX_BODY:
+        if n > limit:
             raise ApiError(413, "body too large")
         raw = self.rfile.read(n) if n else b"{}"
         try:

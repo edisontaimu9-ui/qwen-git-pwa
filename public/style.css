@@ -38,7 +38,8 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .msg.err { color: #ff9a9a; }
 .code { margin: 6px 0; }
 .code pre { margin: 0; padding: 8px; background: #0a0c11; border-radius: 8px; overflow-x: auto; white-space: pre; font-size: 13px; }
-.code button { margin-top: 4px; font-size: 12px; padding: 4px 8px; }
+.code button { margin-top: 4px; margin-right: 6px; font-size: 12px; padding: 4px 8px; }
+.msg.note { color: #9fb0d0; font-size: 14px; }
 #composer { display: flex; gap: 6px; padding-bottom: env(safe-area-inset-bottom); }
 #composer textarea { flex: 1; resize: none; }
 #repoList { display: flex; flex-wrap: wrap; gap: 6px; }
