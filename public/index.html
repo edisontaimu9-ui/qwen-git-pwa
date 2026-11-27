@@ -16,6 +16,7 @@
     <button data-tab="repos">Repos</button>
     <button data-tab="browse">Files</button>
     <button data-tab="search">Search</button>
+    <button data-tab="git">Git</button>
   </nav>
   <span id="net">...</span>
 </header>
@@ -132,6 +133,36 @@
       <label class="muted"><input type="checkbox" id="sRegex"> regex</label>
     </div>
     <div id="sOut"></div>
+  </section>
+
+  <section id="git" class="tab">
+    <div class="row">
+      <select id="gBranch"></select>
+      <button id="gRefresh" type="button">Refresh</button>
+    </div>
+    <div id="gLine" class="muted"></div>
+    <div class="row">
+      <button data-g="pull" type="button">Pull</button>
+      <button data-g="pullr" type="button">Pull (rebase)</button>
+      <button data-g="push" type="button">Push</button>
+      <button id="gHist" type="button">History</button>
+      <button id="gFull" type="button">Full diff</button>
+    </div>
+    <form id="gBranchForm" class="row">
+      <input id="gNewBranch" placeholder="new branch name" autocapitalize="off" autocomplete="off">
+      <button type="submit">Create branch</button>
+    </form>
+    <div id="gChanges"></div>
+    <div class="row">
+      <button id="gAll" type="button">Select all</button>
+      <button id="gNone" type="button">Select none</button>
+      <button id="gDiscard" type="button">Discard selected</button>
+    </div>
+    <form id="gCommit" class="row">
+      <input id="gMsg" placeholder="commit message" autocomplete="off">
+      <button type="submit">Commit selected</button>
+    </form>
+    <div id="gView"></div>
   </section>
 </main>
 <div id="toast" hidden></div>

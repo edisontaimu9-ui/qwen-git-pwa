@@ -53,6 +53,7 @@ def git_env():
         GIT_ALLOW_PROTOCOL="https:ssh",
         GIT_SSH_COMMAND="ssh -o BatchMode=yes",
         LC_ALL="C",
+        GIT_LITERAL_PATHSPECS="1",
     )
 
 
@@ -60,7 +61,7 @@ def git(args, cwd, timeout=300):
     env = git_env()
     try:
         p = subprocess.run(["git"] + args, cwd=str(cwd), env=env,
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"ok": False, "output": "git timed out"}
     out = (p.stdout + p.stderr)
@@ -169,8 +170,9 @@ def r_commit(h, q):
 
 
 def r_pull(h, q):
-    p = repo_path(h.read_json().get("repo"))
-    h.send_json(200, git(["pull", "--ff-only"], p, 600))
+    d = h.read_json()
+    p = repo_path(d.get("repo"))
+    h.send_json(200, git(["pull", "--rebase" if d.get("rebase") else "--ff-only"], p, 600))
 
 
 def r_push(h, q):
@@ -513,6 +515,216 @@ def r_tree(h, q):
     h.send_json(200, {"tree": root.name + "/\n" + "\n".join(lines), "files": n, "truncated": len(lines) >= 1500})
 
 
+HASH_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def git_text(args, cwd, ok=(0,), timeout=60):
+    """Run git, return decoded stdout. Raises ApiError unless exit code is in ok."""
+    try:
+        p = subprocess.run(["git"] + args, cwd=str(cwd), env=git_env(),
+                           capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ApiError(504, "git timed out")
+    if p.returncode not in ok:
+        raise ApiError(500, "git failed: " + p.stderr.decode("utf-8", "replace")[:200])
+    out = p.stdout.decode("utf-8", "replace")
+    if len(out) > MAX_OUT:
+        out = out[:MAX_OUT] + "\n[truncated]"
+    return out
+
+
+def has_head(root):
+    try:
+        p = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=str(root),
+                           env=git_env(), capture_output=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return False
+    return p.returncode == 0
+
+
+def parse_status(root):
+    """{path: XY} for every changed or untracked file."""
+    out = git_bytes(["status", "--porcelain", "-z", "-uall"], root)
+    toks = out.split(b"\0")
+    res = {}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if len(t) < 4:
+            continue
+        xy = t[:2].decode("ascii", "replace")
+        if "R" in xy or "C" in xy:
+            i += 1  # original path of a rename or copy
+        try:
+            res[t[3:].decode("utf-8")] = xy
+        except UnicodeDecodeError:
+            pass
+    return res
+
+
+def clean_paths(raw):
+    if not isinstance(raw, list) or not raw or len(raw) > 2000:
+        raise ApiError(400, "paths required")
+    for r in raw:
+        if not isinstance(r, str) or not r or "\x00" in r or r.startswith("/"):
+            raise ApiError(400, "bad path")
+        parts = r.split("/")
+        if ".." in parts or parts[0] == ".git":
+            raise ApiError(400, "bad path")
+    return raw
+
+
+def r_gitinfo(h, q):
+    root = repo_path(q.get("repo"))
+    changes = []
+    for path, xy in sorted(parse_status(root).items(), key=lambda kv: kv[0].lower()):
+        code = "?" if xy == "??" else (xy[0] if xy[0] != " " else xy[1])
+        changes.append({"path": path, "code": code})
+    cur = git_text(["symbolic-ref", "--short", "-q", "HEAD"], root, ok=(0, 1)).strip()
+    local, remote = [], []
+    for ref in git_text(["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"], root).splitlines():
+        if ref.startswith("refs/heads/"):
+            local.append(ref[len("refs/heads/"):])
+        elif ref.startswith("refs/remotes/") and not ref.endswith("/HEAD"):
+            remote.append(ref[len("refs/remotes/"):])
+    if cur and cur not in local:
+        local.insert(0, cur)
+    have = set(local)
+    remote = [r for r in remote if r.split("/", 1)[-1] not in have]
+    st = git_text(["status", "-sb", "--untracked-files=no"], root, timeout=30).splitlines()
+    line = st[0][3:] if st and st[0].startswith("## ") else (st[0] if st else "")
+    h.send_json(200, {"branch": cur, "local": local, "remote": remote, "changes": changes, "line": line})
+
+
+def r_filediff(h, q):
+    root = repo_path(q.get("repo"))
+    rel = q.get("path", "")
+    clean_paths([rel])
+    chg = parse_status(root)
+    if rel not in chg:
+        raise ApiError(404, "no changes in that file")
+    if chg[rel] == "??":
+        out = git_text(["diff", "--no-index", "--no-color", "--", "/dev/null", rel], root, ok=(0, 1))
+    elif has_head(root):
+        out = git_text(["diff", "HEAD", "--no-color", "--", rel], root)
+    else:
+        out = git_text(["diff", "--cached", "--no-color", "--", rel], root)
+    h.send_json(200, {"diff": out})
+
+
+def r_commit_files(h, q):
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    msg = str(d.get("message", "")).strip()
+    if not msg or len(msg) > 500:
+        raise ApiError(400, "message required (max 500 chars)")
+    paths = clean_paths(d.get("paths"))
+    chg = parse_status(root)
+    for p in paths:
+        if p not in chg:
+            raise ApiError(400, "not a changed file: " + p)
+    a = git(["add", "-A", "--"] + paths, root)
+    if not a["ok"]:
+        h.send_json(200, a)
+        return
+    args = ["commit", "-m", msg]
+    if has_head(root):
+        args += ["--"] + paths  # commit only the selected files
+    h.send_json(200, git(args, root))
+
+
+def r_discard(h, q):
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    paths = clean_paths(d.get("paths"))
+    chg = parse_status(root)
+    head = has_head(root)
+    done = 0
+    notes = []
+    for rel in paths:
+        xy = chg.get(rel)
+        if xy is None:
+            notes.append("skipped (no changes): " + rel)
+            continue
+        if xy == "??":
+            p = root / rel
+            try:
+                if not p.is_symlink():
+                    safe_join(root, rel)
+                    if not p.is_file():
+                        raise ApiError(400, "not a file")
+                p.unlink()
+                done += 1
+            except (ApiError, OSError):
+                notes.append("could not delete: " + rel)
+            continue
+        in_head = head and git(["cat-file", "-e", "HEAD:" + rel], root, 20)["ok"]
+        r = git(["checkout", "HEAD", "--", rel], root) if in_head else git(["rm", "-f", "--", rel], root)
+        if r["ok"]:
+            done += 1
+        else:
+            notes.append(rel + ": " + r["output"].strip()[:150])
+    msg = "Discarded changes in %d file(s)." % done
+    if notes:
+        msg += "\n" + "\n".join(notes)
+    h.send_json(200, {"ok": done > 0 or not notes, "output": msg})
+
+
+def r_log(h, q):
+    root = repo_path(q.get("repo"))
+    try:
+        n = min(100, max(1, int(q.get("n", "30"))))
+    except ValueError:
+        n = 30
+    if not has_head(root):
+        h.send_json(200, {"commits": []})
+        return
+    out = git_text(["log", "-n", str(n), "--format=%H%x1f%an%x1f%ar%x1f%s%x1e"], root)
+    commits = []
+    for rec in out.split("\x1e"):
+        f = rec.strip("\n").split("\x1f")
+        if len(f) == 4:
+            commits.append({"hash": f[0], "short": f[0][:7], "author": f[1], "when": f[2], "subject": f[3]})
+    h.send_json(200, {"commits": commits})
+
+
+def r_show(h, q):
+    root = repo_path(q.get("repo"))
+    hs = q.get("hash", "")
+    if not HASH_RE.match(hs):
+        raise ApiError(400, "bad commit id")
+    h.send_json(200, {"text": git_text(["show", "--stat", "--patch", "--no-color", hs], root)})
+
+
+def r_revert(h, q):
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    hs = str(d.get("hash", ""))
+    if not HASH_RE.match(hs):
+        raise ApiError(400, "bad commit id")
+    r = git(["revert", "--no-edit", hs], root, 120)
+    if not r["ok"]:
+        git(["revert", "--abort"], root, 20)
+        r["output"] += "\nNothing was reverted. Commit or discard your changes first, or resolve conflicts in a terminal."
+    h.send_json(200, r)
+
+
+def r_switch(h, q):
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    name = str(d.get("name", "")).strip()
+    if not name or name.startswith("-") or not git(["check-ref-format", "--branch", name], root, 20)["ok"]:
+        raise ApiError(400, "bad branch name")
+    if git(["show-ref", "--verify", "--quiet", "refs/heads/" + name], root, 20)["ok"]:
+        res = git(["switch", name], root)
+    elif git(["show-ref", "--verify", "--quiet", "refs/remotes/" + name], root, 20)["ok"]:
+        res = git(["switch", "--track", name], root)
+    else:
+        raise ApiError(404, "branch not found")
+    h.send_json(200, res)
+
+
 ROUTES = {
     ("GET", "/api/tags"): r_tags,
     ("POST", "/api/chat"): r_chat,
@@ -533,6 +745,14 @@ ROUTES = {
     ("POST", "/api/delete"): r_delete,
     ("GET", "/api/search"): r_search,
     ("GET", "/api/tree"): r_tree,
+    ("GET", "/api/gitinfo"): r_gitinfo,
+    ("GET", "/api/filediff"): r_filediff,
+    ("POST", "/api/commit_files"): r_commit_files,
+    ("POST", "/api/discard"): r_discard,
+    ("GET", "/api/log"): r_log,
+    ("GET", "/api/show"): r_show,
+    ("POST", "/api/revert"): r_revert,
+    ("POST", "/api/switch"): r_switch,
     ("POST", "/api/upload"): r_upload,
 }
 

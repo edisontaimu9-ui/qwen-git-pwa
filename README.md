@@ -10,6 +10,17 @@ Nothing is installed or hosted on the server except the existing tunnel to Ollam
 
 Open http://localhost:8787 in Chrome. Use "Add to Home screen" to install.
 
+## Git control centre
+
+The Git tab works on the selected repo.
+
+- Review: see every changed and new file, tap one for its colored diff, or press Full diff.
+- Commit: tick the files you want and press Commit selected. Only those files go in the commit.
+- Revert: Discard selected throws away changes in the ticked files (asks first). In History, open a commit and press Revert this commit to undo it with a new commit.
+- Branches: switch with the menu (remote branches too), or create a new one.
+- Sync: Pull, Pull (rebase) for when the remote has new commits, and Push.
+- History: the latest 40 commits, tap one to see what it changed.
+
 ## Project management
 
 - Repos tab: lists the git repos in the workspace, clones new ones, and creates new projects (Blank, Python, Node or Web page). New projects start with `git init` on `main` and are not committed yet.

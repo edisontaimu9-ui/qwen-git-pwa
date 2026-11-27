@@ -36,6 +36,7 @@ function showTab(id) {
   document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x.dataset.tab === id));
   document.querySelectorAll(".tab").forEach((s) => s.classList.toggle("on", s.id === id));
   if (id === "browse") renderBrowse();
+  if (id === "git") gRefresh();
 }
 document.querySelectorAll("nav button").forEach((b) => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -108,6 +109,9 @@ function selectRepo(name) {
   $("#fTreeOut").hidden = true;
   loadRepos();
   if ($("#browse").classList.contains("on")) renderBrowse();
+  gUnchecked.clear();
+  $("#gView").textContent = "";
+  if ($("#git").classList.contains("on")) gRefresh();
 }
 $("#repo").onchange = () => selectRepo($("#repo").value);
 
@@ -329,6 +333,215 @@ $("#searchForm").onsubmit = async (e) => {
     box.textContent = "";
     note(err.message);
   }
+};
+
+// ---------- git control centre ----------
+const gUnchecked = new Set();
+let gFiles = [];
+
+function diffEl(text) {
+  const pre = document.createElement("pre");
+  text.split("\n").forEach((ln) => {
+    const s = document.createElement("span");
+    s.textContent = ln + "\n";
+    if (/^(\+\+\+|---|diff |index )/.test(ln)) s.className = "dl-meta";
+    else if (ln.startsWith("@@")) s.className = "dl-hunk";
+    else if (ln[0] === "+") s.className = "dl-add";
+    else if (ln[0] === "-") s.className = "dl-del";
+    pre.append(s);
+  });
+  return pre;
+}
+
+function gShow(text, title, buttons) {
+  const v = $("#gView");
+  v.textContent = "";
+  if (title || buttons) {
+    const bar = document.createElement("div");
+    bar.className = "row";
+    if (title) {
+      const b = document.createElement("b");
+      b.className = "muted";
+      b.textContent = title;
+      bar.append(b);
+    }
+    (buttons || []).forEach(([label, fn]) => {
+      const x = document.createElement("button");
+      x.type = "button";
+      x.textContent = label;
+      x.onclick = fn;
+      bar.append(x);
+    });
+    v.append(bar);
+  }
+  v.append(diffEl(text));
+}
+
+function gSelected() {
+  return gFiles.filter((c) => !gUnchecked.has(c.path)).map((c) => c.path);
+}
+
+async function gRefresh() {
+  const list = $("#gChanges");
+  const sel = $("#gBranch");
+  if (!currentRepo) {
+    $("#gLine").textContent = "Pick a repo in the Repos tab first.";
+    list.textContent = "";
+    sel.textContent = "";
+    gFiles = [];
+    return;
+  }
+  try {
+    const j = await api("/api/gitinfo?repo=" + enc(currentRepo));
+    $("#gLine").textContent = currentRepo + "  " + j.line;
+    sel.textContent = "";
+    if (!j.branch) sel.add(new Option("(detached HEAD)", ""));
+    const group = (label, names) => {
+      if (!names.length) return;
+      const g = document.createElement("optgroup");
+      g.label = label;
+      names.forEach((n) => g.append(new Option(n, n)));
+      sel.append(g);
+    };
+    group("Local", j.local);
+    group("Remote", j.remote);
+    sel.value = j.branch || "";
+    gFiles = j.changes;
+    list.textContent = "";
+    if (!gFiles.length) {
+      const d = document.createElement("div");
+      d.className = "muted";
+      d.style.padding = "8px";
+      d.textContent = "No changes. Working tree clean.";
+      list.append(d);
+    }
+    gFiles.forEach((c) => {
+      const row = document.createElement("div");
+      row.className = "chg";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !gUnchecked.has(c.path);
+      cb.onchange = () => { if (cb.checked) gUnchecked.delete(c.path); else gUnchecked.add(c.path); };
+      const bd = document.createElement("span");
+      bd.className = "badge b" + (c.code === "?" ? "Q" : c.code);
+      bd.textContent = c.code;
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = c.path;
+      nm.onclick = () => gFileDiff(c.path);
+      row.append(cb, bd, nm);
+      list.append(row);
+    });
+  } catch (e) {
+    $("#gLine").textContent = e.message;
+  }
+}
+
+async function gFileDiff(path) {
+  try {
+    const j = await api("/api/filediff?repo=" + enc(currentRepo) + "&path=" + enc(path));
+    gShow(j.diff.trim() ? j.diff : "(no textual changes)", path);
+  } catch (e) { gShow(e.message, path); }
+}
+
+async function gRun(act, extra, title) {
+  if (!currentRepo) { toast("Pick a repo first"); return null; }
+  gShow("working...", title);
+  try {
+    const r = await api("/api/" + act, Object.assign({ repo: currentRepo }, extra || {}));
+    gShow((r.ok === false ? "FAILED\n" : "") + (r.output || "ok"), title);
+    gRefresh();
+    loadRepos();
+    return r;
+  } catch (e) {
+    gShow(e.message, title);
+    gRefresh();
+    return null;
+  }
+}
+
+async function gHistory() {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  try {
+    const j = await api("/api/log?repo=" + enc(currentRepo) + "&n=40");
+    if (!j.commits.length) { gShow("No commits yet.", "History"); return; }
+    const v = $("#gView");
+    v.textContent = "";
+    j.commits.forEach((c) => {
+      const d = document.createElement("div");
+      d.className = "hit";
+      const b = document.createElement("b");
+      b.textContent = c.short + "  " + c.author + "  " + c.when;
+      const s = document.createElement("span");
+      s.textContent = c.subject;
+      d.append(b, s);
+      d.onclick = () => gCommitView(c);
+      v.append(d);
+    });
+  } catch (e) { gShow(e.message, "History"); }
+}
+
+async function gCommitView(c) {
+  try {
+    const j = await api("/api/show?repo=" + enc(currentRepo) + "&hash=" + c.hash);
+    gShow(j.text, c.short + " " + c.subject, [
+      ["Back", gHistory],
+      ["Revert this commit", () => {
+        if (window.confirm("Create a new commit that undoes " + c.short + "?")) gRun("revert", { hash: c.hash }, "Revert " + c.short);
+      }],
+    ]);
+  } catch (e) { gShow(e.message, c.short); }
+}
+
+document.querySelectorAll("#git [data-g]").forEach((b) => {
+  b.onclick = () => {
+    const k = b.dataset.g;
+    if (k === "pull") gRun("pull", {}, "Pull");
+    else if (k === "pullr") gRun("pull", { rebase: true }, "Pull (rebase)");
+    else gRun("push", {}, "Push");
+  };
+});
+$("#gRefresh").onclick = () => gRefresh();
+$("#gHist").onclick = () => gHistory();
+$("#gFull").onclick = async () => {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  try {
+    const r = await api("/api/diff?repo=" + enc(currentRepo));
+    gShow(r.ok === false ? "FAILED\n" + r.output : (r.output.trim() || "No changes to tracked files since the last commit."), "Full diff vs last commit");
+  } catch (e) { gShow(e.message, "Full diff"); }
+};
+$("#gBranch").onchange = () => {
+  if ($("#gBranch").value) gRun("switch", { name: $("#gBranch").value }, "Switch branch");
+};
+$("#gBranchForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const n = $("#gNewBranch").value.trim();
+  if (!n) return;
+  const r = await gRun("branch", { name: n }, "New branch");
+  if (r && r.ok) $("#gNewBranch").value = "";
+};
+function gSetAll(on) {
+  gUnchecked.clear();
+  if (!on) gFiles.forEach((c) => gUnchecked.add(c.path));
+  document.querySelectorAll("#gChanges input").forEach((i) => { i.checked = on; });
+}
+$("#gAll").onclick = () => gSetAll(true);
+$("#gNone").onclick = () => gSetAll(false);
+$("#gCommit").onsubmit = async (e) => {
+  e.preventDefault();
+  const message = $("#gMsg").value.trim();
+  const paths = gSelected();
+  if (!message) { toast("Write a commit message"); return; }
+  if (!paths.length) { toast("Select at least one file"); return; }
+  const r = await gRun("commit_files", { paths, message }, "Commit");
+  if (r && r.ok) $("#gMsg").value = "";
+};
+$("#gDiscard").onclick = () => {
+  const paths = gSelected();
+  if (!paths.length) { toast("Select at least one file"); return; }
+  const names = paths.slice(0, 8).join("\n") + (paths.length > 8 ? "\n...and " + (paths.length - 8) + " more" : "");
+  if (!window.confirm("Discard changes to " + paths.length + " file(s)? This cannot be undone.\n\n" + names)) return;
+  gRun("discard", { paths }, "Discard");
 };
 
 // ---------- attachments ----------

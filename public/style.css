@@ -9,7 +9,7 @@ header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 6px 10px; border-bottom: 1px solid #232733;
 }
-nav button { margin-right: 4px; padding: 6px 9px; }
+nav button { margin-right: 3px; padding: 6px 8px; font-size: 13px; }
 button, select, input, textarea {
   font: inherit; color: inherit; background: #1a1e29;
   border: 1px solid #2c3242; border-radius: 8px; padding: 8px 10px;
@@ -59,3 +59,17 @@ h3 { margin: 4px 0; }
 #editor { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
 #editor[hidden] { display: none; }
 #edText { flex: 1; min-height: 0; resize: none; font: 13px/1.4 ui-monospace, monospace; white-space: pre; overflow: auto; }
+header { flex-wrap: wrap; gap: 4px; }
+#git { overflow-y: auto; }
+#gChanges { max-height: 28vh; overflow: auto; border: 1px solid #2c3242; border-radius: 8px; flex: 0 0 auto; }
+#gView { flex: 1 0 220px; overflow: auto; }
+#gView pre { margin: 0; padding: 8px; background: #0a0c11; border-radius: 8px; font-size: 12px; white-space: pre; overflow: auto; }
+#gView .row { margin-bottom: 6px; align-items: center; }
+#gView .hit { padding: 8px 10px; border-bottom: 1px solid #232733; cursor: pointer; word-break: break-word; }
+#gView .hit b { display: block; font-size: 12px; font-weight: 600; color: #9fb0d0; }
+.chg { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #232733; }
+.chg input { width: 20px; height: 20px; padding: 0; flex: 0 0 auto; }
+.chg .nm { flex: 1; word-break: break-all; cursor: pointer; font-size: 14px; }
+.badge { font: 12px ui-monospace, monospace; width: 18px; text-align: center; flex: 0 0 auto; }
+.bM { color: #e5c07b; } .bA, .bQ { color: #6bd68a; } .bD { color: #ff7a7a; } .bR, .bC { color: #7fb2ff; } .bU { color: #ff9a9a; }
+.dl-add { color: #6bd68a; } .dl-del { color: #ff7a7a; } .dl-hunk { color: #7fb2ff; } .dl-meta { color: #8b93a7; }
