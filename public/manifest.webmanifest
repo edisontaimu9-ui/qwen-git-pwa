@@ -1,13 +1,36 @@
 {
-  "name": "BataCode",
-  "short_name": "BataCode",
+  "name": "Qwen Git PWA",
+  "short_name": "GitPWA",
+  "description": "Git operations and AI assistant in a browser",
   "start_url": "/",
-  "scope": "/",
   "display": "standalone",
-  "background_color": "#0f1115",
-  "theme_color": "#0f1115",
+  "background_color": "#1e293b",
+  "theme_color": "#3b82f6",
+  "orientation": "portrait-primary",
   "icons": [
-    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-bc-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-bc-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
   ]
 }
