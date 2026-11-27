@@ -125,7 +125,7 @@ def r_repos(h, q):
             if p.is_dir() and (p / ".git").exists() and NAME_RE.match(p.name):
                 b = git(["rev-parse", "--abbrev-ref", "HEAD"], p, 20)
                 items.append({"name": p.name, "branch": b["output"].strip() if b["ok"] else "?"})
-    h.send_json(200, {"repos": items})
+    h.send_json(200, {"repos": items, "workspace": str(WORKSPACE).replace(str(Path.home()), "~", 1)})
 
 
 def r_clone(h, q):
@@ -382,6 +382,137 @@ def r_context(h, q):
     })
 
 
+TEMPLATES = {
+    "blank": {"README.md": "# {name}\n"},
+    "python": {
+        "README.md": "# {name}\n",
+        "main.py": 'def main():\n    print("Hello from {name}")\n\n\nif __name__ == "__main__":\n    main()\n',
+        ".gitignore": "__pycache__/\n*.pyc\n.venv/\n",
+    },
+    "node": {
+        "README.md": "# {name}\n",
+        "index.js": 'console.log("Hello from {name}");\n',
+        "package.json": '{\n  "name": "{name}",\n  "version": "0.1.0",\n  "main": "index.js"\n}\n',
+        ".gitignore": "node_modules/\n",
+    },
+    "web": {
+        "README.md": "# {name}\n",
+        "index.html": '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>{name}</title>\n<link rel="stylesheet" href="style.css">\n</head>\n<body>\n<h1>{name}</h1>\n<script src="app.js"></script>\n</body>\n</html>\n',
+        "style.css": "body { font-family: system-ui, sans-serif; margin: 1rem; }\n",
+        "app.js": 'console.log("{name} loaded");\n',
+    },
+}
+
+
+def r_create(h, q):
+    d = h.read_json()
+    name = str(d.get("name", "")).strip()
+    if not NAME_RE.match(name):
+        raise ApiError(400, "bad project name (letters, digits, . _ - only)")
+    tpl = TEMPLATES.get(str(d.get("template", "blank")))
+    if tpl is None:
+        raise ApiError(400, "unknown template")
+    dest = WORKSPACE / name
+    if dest.exists():
+        raise ApiError(409, "folder already exists")
+    dest.mkdir(parents=True)
+    init = git(["init"], dest, 60)
+    if not init["ok"]:
+        h.send_json(200, init)
+        return
+    git(["symbolic-ref", "HEAD", "refs/heads/main"], dest, 20)
+    for fname, body in tpl.items():
+        (dest / fname).write_text(body.replace("{name}", name), encoding="utf-8")
+    h.send_json(200, {"ok": True, "name": name,
+                      "output": "Created %s with %d file(s). Commit when ready." % (name, len(tpl))})
+
+
+def r_delete(h, q):
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    p = safe_join(root, str(d.get("path", "")))
+    if not p.is_file():
+        raise ApiError(404, "file not found")
+    p.unlink()
+    h.send_json(200, {"ok": True})
+
+
+def r_search(h, q):
+    term = q.get("q", "")
+    if not term or len(term) > 200:
+        raise ApiError(400, "search text required (max 200 chars)")
+    if q.get("repo"):
+        names = [q["repo"]]
+        repo_path(q["repo"])
+    else:
+        names = [p.name for p in sorted(WORKSPACE.iterdir())
+                 if p.is_dir() and (p / ".git").exists() and NAME_RE.match(p.name)] if WORKSPACE.exists() else []
+    mode = "-E" if q.get("regex") == "1" else "-F"
+    results = []
+    capped = False
+    for name in names:
+        root = repo_path(name)
+        try:
+            p = subprocess.run(
+                ["git", "grep", "-n", "-I", "-i", mode, "--untracked", "--no-color", "-z", "-e", term],
+                cwd=str(root), env=git_env(), capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise ApiError(504, "search timed out in " + name)
+        if p.returncode == 1:
+            continue
+        if p.returncode != 0:
+            raise ApiError(400, "bad search pattern" if mode == "-E" else "search failed")
+        for line in p.stdout[:2_000_000].split(b"\n"):
+            parts = line.split(b"\0", 2)
+            if len(parts) != 3 or not parts[1].isdigit():
+                continue
+            results.append({
+                "repo": name,
+                "path": parts[0].decode("utf-8", "replace"),
+                "line": int(parts[1]),
+                "text": parts[2].decode("utf-8", "replace").strip()[:200],
+            })
+            if len(results) >= 300:
+                capped = True
+                break
+        if capped:
+            break
+    h.send_json(200, {"results": results, "capped": capped})
+
+
+def r_tree(h, q):
+    root = repo_path(q.get("repo"))
+    out = git_bytes(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root)
+    top = {}
+    n = 0
+    for t in out.split(b"\0"):
+        if not t:
+            continue
+        try:
+            parts = t.decode("utf-8").split("/")
+        except UnicodeDecodeError:
+            continue
+        node = top
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = None
+        n += 1
+    lines = []
+
+    def walk(node, prefix):
+        items = sorted(node.items(), key=lambda kv: (kv[1] is None, kv[0].lower()))
+        for i, (k, v) in enumerate(items):
+            if len(lines) >= 1500:
+                return
+            last = i == len(items) - 1
+            lines.append(prefix + ("\u2514\u2500\u2500 " if last else "\u251c\u2500\u2500 ") + k + ("/" if v is not None else ""))
+            if v is not None:
+                walk(v, prefix + ("    " if last else "\u2502   "))
+
+    walk(top, "")
+    h.send_json(200, {"tree": root.name + "/\n" + "\n".join(lines), "files": n, "truncated": len(lines) >= 1500})
+
+
 ROUTES = {
     ("GET", "/api/tags"): r_tags,
     ("POST", "/api/chat"): r_chat,
@@ -398,6 +529,10 @@ ROUTES = {
     ("POST", "/api/file"): r_file_post,
     ("GET", "/api/zip"): r_zip,
     ("GET", "/api/context"): r_context,
+    ("POST", "/api/create"): r_create,
+    ("POST", "/api/delete"): r_delete,
+    ("GET", "/api/search"): r_search,
+    ("GET", "/api/tree"): r_tree,
     ("POST", "/api/upload"): r_upload,
 }
 

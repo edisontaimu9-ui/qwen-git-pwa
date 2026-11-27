@@ -32,11 +32,13 @@ function toast(t) {
 }
 
 // ---------- tabs ----------
+function showTab(id) {
+  document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x.dataset.tab === id));
+  document.querySelectorAll(".tab").forEach((s) => s.classList.toggle("on", s.id === id));
+  if (id === "browse") renderBrowse();
+}
 document.querySelectorAll("nav button").forEach((b) => {
-  b.onclick = () => {
-    document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x === b));
-    document.querySelectorAll(".tab").forEach((s) => s.classList.toggle("on", s.id === b.dataset.tab));
-  };
+  b.onclick = () => showTab(b.dataset.tab);
 });
 
 // ---------- Ollama status and models ----------
@@ -66,7 +68,8 @@ let currentRepo = store.get("repo", "");
 
 async function loadRepos() {
   try {
-    const { repos } = await api("/api/repos");
+    const { repos, workspace } = await api("/api/repos");
+    $("#wsPath").textContent = "Workspace: " + (workspace || "") + (repos.length ? "" : " (no repos yet)");
     const sel = $("#repo");
     sel.textContent = "";
     sel.add(new Option("no repo", ""));
@@ -100,7 +103,11 @@ function selectRepo(name) {
   attachments.length = 0;
   renderChips();
   $("#files").hidden = true;
+  browsePath = "";
+  closeEditor(true);
+  $("#fTreeOut").hidden = true;
   loadRepos();
+  if ($("#browse").classList.contains("on")) renderBrowse();
 }
 $("#repo").onchange = () => selectRepo($("#repo").value);
 
@@ -146,6 +153,181 @@ $("#cloneForm").onsubmit = async (e) => {
     loadRepos();
   } catch (err) {
     $("#out").textContent = err.message;
+  }
+};
+
+// ---------- new project ----------
+$("#newForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const name = $("#newName").value.trim();
+  if (!name) return;
+  $("#out").textContent = "creating...";
+  try {
+    const r = await api("/api/create", { name, template: $("#newTpl").value });
+    show(r);
+    $("#newName").value = "";
+    selectRepo(r.name);
+  } catch (err) {
+    $("#out").textContent = err.message;
+  }
+};
+
+// ---------- file browser and editor ----------
+let browsePath = "";
+let openPath = "";
+let dirty = false;
+const enc = encodeURIComponent;
+
+async function renderBrowse() {
+  const box = $("#fList");
+  box.textContent = "";
+  $("#fPath").textContent = currentRepo ? currentRepo + "/" + browsePath : "";
+  if (!currentRepo) {
+    const d = document.createElement("div");
+    d.textContent = "Pick a repo in the Repos tab first.";
+    box.append(d);
+    return;
+  }
+  try {
+    const { items } = await api("/api/files?repo=" + enc(currentRepo) + "&path=" + enc(browsePath));
+    const add = (label, fn) => {
+      const d = document.createElement("div");
+      d.textContent = label;
+      d.onclick = fn;
+      box.append(d);
+    };
+    if (browsePath) add("..", () => { browsePath = browsePath.split("/").slice(0, -1).join("/"); renderBrowse(); });
+    items.forEach((it) => {
+      const full = browsePath ? browsePath + "/" + it.name : it.name;
+      if (it.dir) add(it.name + "/", () => { browsePath = full; renderBrowse(); });
+      else add(it.name, () => openFile(full));
+    });
+    if (!items.length) add("(empty folder)", () => {});
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function openFile(path, line) {
+  if (dirty && !window.confirm("Discard unsaved changes?")) return;
+  try {
+    const j = await api("/api/file?repo=" + enc(currentRepo) + "&path=" + enc(path));
+    openPath = path;
+    dirty = false;
+    const ta = $("#edText");
+    ta.value = j.content;
+    $("#edName").textContent = currentRepo + "/" + path;
+    $("#editor").hidden = false;
+    $("#fList").hidden = true;
+    $("#fTreeOut").hidden = true;
+    ta.scrollTop = 0;
+    if (line) {
+      const lines = j.content.split("\n");
+      let off = 0;
+      for (let i = 0; i < line - 1 && i < lines.length; i++) off += lines[i].length + 1;
+      const end = off + (lines[line - 1] || "").length;
+      ta.focus();
+      ta.setSelectionRange(off, end);
+      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 18;
+      ta.scrollTop = Math.max(0, (line - 4) * lh);
+    }
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+function closeEditor(force) {
+  if (!force && dirty && !window.confirm("Discard unsaved changes?")) return;
+  dirty = false;
+  openPath = "";
+  $("#editor").hidden = true;
+  $("#fList").hidden = false;
+}
+
+$("#edText").oninput = () => { dirty = true; };
+$("#edClose").onclick = () => { closeEditor(false); };
+$("#edSave").onclick = async () => {
+  if (!openPath) return;
+  try {
+    await api("/api/file", { repo: currentRepo, path: openPath, content: $("#edText").value });
+    dirty = false;
+    toast("Saved " + openPath);
+  } catch (e) { toast(e.message); }
+};
+$("#edDel").onclick = async () => {
+  if (!openPath || !window.confirm("Delete " + openPath + "?")) return;
+  try {
+    await api("/api/delete", { repo: currentRepo, path: openPath });
+    toast("Deleted " + openPath);
+    closeEditor(true);
+    renderBrowse();
+  } catch (e) { toast(e.message); }
+};
+$("#fNew").onclick = async () => {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  const p = (window.prompt("New file path in " + currentRepo + " (example: src/util.py)", browsePath ? browsePath + "/" : "") || "").trim();
+  if (!p || p.endsWith("/")) return;
+  try {
+    try {
+      await api("/api/file?repo=" + enc(currentRepo) + "&path=" + enc(p));
+    } catch (x) {
+      await api("/api/file", { repo: currentRepo, path: p, content: "" });
+    }
+    browsePath = p.split("/").slice(0, -1).join("/");
+    await renderBrowse();
+    openFile(p);
+  } catch (e) { toast(e.message); }
+};
+$("#fTree").onclick = async () => {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  const out = $("#fTreeOut");
+  if (!out.hidden) { out.hidden = true; $("#fList").hidden = !$("#editor").hidden; return; }
+  try {
+    const j = await api("/api/tree?repo=" + enc(currentRepo));
+    out.textContent = j.tree + "\n\n" + j.files + " files" + (j.truncated ? " (list cut at 1500 lines)" : "");
+    out.hidden = false;
+    $("#fList").hidden = true;
+    $("#editor").hidden = true;
+  } catch (e) { toast(e.message); }
+};
+
+// ---------- search across repos ----------
+$("#searchForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const q = $("#sq").value.trim();
+  const box = $("#sOut");
+  if (!q) return;
+  const one = $("#sScope").value === "repo";
+  if (one && !currentRepo) { toast("Pick a repo first"); return; }
+  box.textContent = "";
+  const note = (t) => { const d = document.createElement("div"); d.textContent = t; box.append(d); };
+  note("searching...");
+  try {
+    const j = await api("/api/search?q=" + enc(q) + (one ? "&repo=" + enc(currentRepo) : "") +
+      ($("#sRegex").checked ? "&regex=1" : ""));
+    box.textContent = "";
+    if (!j.results.length) { note("No matches."); return; }
+    j.results.forEach((r) => {
+      const d = document.createElement("div");
+      d.className = "hit";
+      const b = document.createElement("b");
+      b.textContent = r.repo + "/" + r.path + ":" + r.line;
+      const s = document.createElement("span");
+      s.textContent = r.text;
+      d.append(b, s);
+      d.onclick = () => {
+        if (r.repo !== currentRepo) selectRepo(r.repo);
+        showTab("browse");
+        browsePath = r.path.split("/").slice(0, -1).join("/");
+        renderBrowse();
+        openFile(r.path, r.line);
+      };
+      box.append(d);
+    });
+    if (j.capped) note("Showing the first 300 matches. Narrow the search.");
+  } catch (err) {
+    box.textContent = "";
+    note(err.message);
   }
 };
 

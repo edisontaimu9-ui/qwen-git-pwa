@@ -14,6 +14,8 @@
   <nav>
     <button data-tab="chat" class="on">Chat</button>
     <button data-tab="repos">Repos</button>
+    <button data-tab="browse">Files</button>
+    <button data-tab="search">Search</button>
   </nav>
   <span id="net">...</span>
 </header>
@@ -57,6 +59,17 @@
       <input id="cloneName" placeholder="folder (optional)" autocapitalize="off" autocomplete="off">
       <button type="submit">Clone</button>
     </form>
+    <form id="newForm" class="row">
+      <input id="newName" placeholder="new project name" autocapitalize="off" autocomplete="off">
+      <select id="newTpl">
+        <option value="blank">Blank</option>
+        <option value="python">Python</option>
+        <option value="node">Node</option>
+        <option value="web">Web page</option>
+      </select>
+      <button type="submit">Create</button>
+    </form>
+    <div id="wsPath" class="muted"></div>
     <div id="repoList"></div>
     <div id="repoPanel" hidden>
       <h3 id="repoTitle"></h3>
@@ -85,6 +98,40 @@
       </form>
     </div>
     <pre id="out"></pre>
+  </section>
+
+  <section id="browse" class="tab">
+    <div class="row">
+      <b id="fPath" class="muted"></b>
+      <button id="fNew" type="button">New file</button>
+      <button id="fTree" type="button">Structure</button>
+    </div>
+    <div id="fList"></div>
+    <pre id="fTreeOut" hidden></pre>
+    <div id="editor" hidden>
+      <div class="row">
+        <b id="edName" class="muted"></b>
+        <button id="edSave" type="button">Save</button>
+        <button id="edDel" type="button">Delete</button>
+        <button id="edClose" type="button">Close</button>
+      </div>
+      <textarea id="edText" spellcheck="false" wrap="off" autocapitalize="off" autocomplete="off"></textarea>
+    </div>
+  </section>
+
+  <section id="search" class="tab">
+    <form id="searchForm" class="row">
+      <input id="sq" placeholder="search code" autocapitalize="off" autocomplete="off">
+      <button type="submit">Search</button>
+    </form>
+    <div class="row">
+      <select id="sScope">
+        <option value="all">All repos</option>
+        <option value="repo">Current repo</option>
+      </select>
+      <label class="muted"><input type="checkbox" id="sRegex"> regex</label>
+    </div>
+    <div id="sOut"></div>
   </section>
 </main>
 <div id="toast" hidden></div>

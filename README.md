@@ -10,6 +10,12 @@ Nothing is installed or hosted on the server except the existing tunnel to Ollam
 
 Open http://localhost:8787 in Chrome. Use "Add to Home screen" to install.
 
+## Project management
+
+- Repos tab: lists the git repos in the workspace, clones new ones, and creates new projects (Blank, Python, Node or Web page). New projects start with `git init` on `main` and are not committed yet.
+- Files tab: browse folders, open and edit files (Save, Delete, New file), and view the project structure as a tree.
+- Search tab: search code across all repos or just the current one, with an optional regex. Tap a result to open the file at that line.
+
 ## AI coding assistant
 
 - Chat with the Qwen model on your server. The conversation is kept between sessions (last 40 messages) and the context size is set with the ctx menu (default 8k).

@@ -9,7 +9,7 @@ header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 6px 10px; border-bottom: 1px solid #232733;
 }
-nav button { margin-right: 6px; }
+nav button { margin-right: 4px; padding: 6px 9px; }
 button, select, input, textarea {
   font: inherit; color: inherit; background: #1a1e29;
   border: 1px solid #2c3242; border-radius: 8px; padding: 8px 10px;
@@ -50,3 +50,12 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 #out { flex: 1; min-height: 80px; margin: 0; padding: 8px; overflow: auto; background: #0a0c11; border-radius: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
 #toast { position: fixed; left: 50%; bottom: 80px; transform: translateX(-50%); background: #26407a; padding: 8px 14px; border-radius: 8px; }
 h3 { margin: 4px 0; }
+.muted { color: #8b93a7; font-size: 12px; }
+#fList, #sOut { flex: 1; min-height: 0; overflow: auto; border: 1px solid #2c3242; border-radius: 8px; }
+#fList div, #sOut div { padding: 8px 10px; border-bottom: 1px solid #232733; cursor: pointer; word-break: break-word; }
+#sOut .hit b { display: block; font-size: 12px; font-weight: 600; color: #9fb0d0; }
+#sOut .hit span { font: 12px ui-monospace, monospace; white-space: pre-wrap; }
+#fTreeOut { flex: 1; min-height: 0; margin: 0; padding: 8px; overflow: auto; background: #0a0c11; border-radius: 8px; font-size: 12px; white-space: pre; }
+#editor { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+#editor[hidden] { display: none; }
+#edText { flex: 1; min-height: 0; resize: none; font: 13px/1.4 ui-monospace, monospace; white-space: pre; overflow: auto; }
