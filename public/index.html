@@ -17,6 +17,7 @@
     <button data-tab="browse">Files</button>
     <button data-tab="search">Search</button>
     <button data-tab="git">Git</button>
+    <button data-tab="auto">Auto</button>
   </nav>
   <span id="net">...</span>
 </header>
@@ -163,6 +164,28 @@
       <button type="submit">Commit selected</button>
     </form>
     <div id="gView"></div>
+  </section>
+
+  <section id="auto" class="tab">
+    <div id="aLine" class="muted"></div>
+    <textarea id="aReq" rows="3" placeholder="Describe the bug to fix or the feature to build. Optional for the other actions (use it to focus them)."></textarea>
+    <div class="row">
+      <select id="aScope" title="Which files to look at">
+        <option value="changes">Scope: changed files</option>
+        <option value="all">Scope: whole project</option>
+      </select>
+      <label class="muted"><input type="checkbox" id="aRun" checked> run tests</label>
+    </div>
+    <div id="aBtns" class="grid">
+      <button type="button" data-a="analyze">Analyze project<small>structure, risks, next steps</small></button>
+      <button type="button" data-a="bugs">Find and fix bugs<small>syntax check, tests, fixes</small></button>
+      <button type="button" data-a="feature">Build a feature<small>plan and code from your text</small></button>
+      <button type="button" data-a="review">Review code<small>security and quality scan</small></button>
+      <button type="button" data-a="tests">Generate tests<small>unit and integration</small></button>
+      <button type="button" data-a="docs">Write docs<small>README and technical docs</small></button>
+      <button type="button" data-a="deps">Check dependencies<small>outdated and incompatible</small></button>
+    </div>
+    <pre id="aOut"></pre>
   </section>
 </main>
 <div id="toast" hidden></div>

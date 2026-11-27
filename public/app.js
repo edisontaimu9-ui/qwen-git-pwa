@@ -37,6 +37,7 @@ function showTab(id) {
   document.querySelectorAll(".tab").forEach((s) => s.classList.toggle("on", s.id === id));
   if (id === "browse") renderBrowse();
   if (id === "git") gRefresh();
+  if (id === "auto") autoRefresh();
 }
 document.querySelectorAll("nav button").forEach((b) => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -760,7 +761,7 @@ async function chatClone(shown, url, name) {
   }
   renderText(el, text);
   history.push({ role: "assistant", content: text, local: true });
-  store.set("hist", history);
+  saveHist();
 }
 
 // ---------- lightweight memory ----------
@@ -783,7 +784,7 @@ async function memoryCmd(shown, cmd, arg) {
   }
   addMsg("assistant", text, true);
   history.push({ role: "assistant", content: text, local: true });
-  store.set("hist", history);
+  saveHist();
 }
 loadMemory();
 
@@ -792,10 +793,30 @@ const SYSTEM = "You are a coding assistant running on the user's own server. Exp
 let history = store.get("hist", []);
 let ctrl = null;
 
-function renderText(el, text) {
+// Persist the chat. Big automation prompts are stored as their short summary, and the
+// oldest messages are dropped if the browser storage quota is hit.
+function saveHist() {
+  let h = history.map((m) => (m.big ? { role: m.role, content: m.shown, shown: m.shown } : m));
+  for (;;) {
+    try { localStorage.setItem("hist", JSON.stringify(h)); return; } catch (e) {
+      if (h.length <= 2) return;
+      h = h.slice(2);
+    }
+  }
+}
+
+function cleanRel(p) {
+  p = String(p || "").trim().replace(/^\.\//, "");
+  return p && !p.startsWith("/") && !p.split("/").includes("..") ? p : "";
+}
+
+function renderText(el, text, done) {
   el.textContent = "";
   let prev = "";
-  text.split("```").forEach((part, i) => {
+  const blocks = [];
+  const pieces = text.split("```");
+  const unclosed = pieces.length % 2 === 0;
+  pieces.forEach((part, i) => {
     if (i % 2 === 0) {
       prev = part;
       if (part) { const s = document.createElement("span"); s.textContent = part; el.append(s); }
@@ -807,6 +828,7 @@ function renderText(el, text) {
     const fpath = fm ? fm[1] : "";
     let code = nl >= 0 ? part.slice(nl + 1) : "";
     code = code.replace(/\n$/, "");
+    if (fpath && cleanRel(fpath) && !(unclosed && i === pieces.length - 1)) blocks.push({ path: cleanRel(fpath), content: code + "\n" });
     const wrap = document.createElement("div");
     wrap.className = "code";
     const pre = document.createElement("pre");
@@ -822,6 +844,50 @@ function renderText(el, text) {
     wrap.append(pre, btn, dl);
     el.append(wrap);
   });
+  if (done && blocks.length) {
+    // the last block for a path wins if the model repeated a file
+    const byPath = new Map();
+    blocks.forEach((b) => byPath.set(b.path, b));
+    const files = Array.from(byPath.values());
+    const bar = document.createElement("div");
+    bar.className = "applybar";
+    const mk = (label, check) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.onclick = () => applyFiles(files, check, b);
+      return b;
+    };
+    const n = document.createElement("span");
+    n.className = "muted";
+    n.textContent = files.length + " file" + (files.length === 1 ? "" : "s") + ":";
+    bar.append(n, mk("Apply to repo", false), mk("Apply and check", true));
+    el.append(bar);
+  }
+}
+
+async function applyFiles(files, check, btn) {
+  if (!currentRepo) { toast("Pick a repo first"); return; }
+  const names = files.slice(0, 10).map((f) => f.path).join("\n") + (files.length > 10 ? "\n...and " + (files.length - 10) + " more" : "");
+  if (!window.confirm("Write " + files.length + " file(s) into " + currentRepo + "? Existing files with these paths are overwritten (git can undo this).\n\n" + names)) return;
+  btn.disabled = true;
+  try {
+    const r = await api("/api/apply", { repo: currentRepo, files });
+    noteMsg("Applied to " + currentRepo + ":\n" + r.output);
+    if (check) await autoChecks(true);
+    else toast("Applied " + r.count + " file(s)");
+  } catch (e) {
+    noteMsg("Apply failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// a local note in the chat (not sent to the model)
+function noteMsg(text) {
+  history.push({ role: "assistant", content: text, local: true });
+  addMsg("assistant", text, true);
+  saveHist();
 }
 
 async function saveBlock(code, def) {
@@ -834,10 +900,10 @@ async function saveBlock(code, def) {
   } catch (e) { toast(e.message); }
 }
 
-function addMsg(role, text, note) {
+function addMsg(role, text, note, streaming) {
   const d = document.createElement("div");
   d.className = "msg " + role + (note ? " note" : "");
-  if (role === "assistant") renderText(d, text); else d.textContent = text;
+  if (role === "assistant") renderText(d, text, !streaming); else d.textContent = text;
   $("#msgs").append(d);
   $("#msgs").scrollTop = $("#msgs").scrollHeight;
   return d;
@@ -851,7 +917,7 @@ function drawHistory() {
 $("#newChat").onclick = () => {
   if (ctrl) ctrl.abort();
   history = [];
-  store.set("hist", history);
+  saveHist();
   drawHistory();
 };
 
@@ -881,9 +947,18 @@ $("#composer").onsubmit = async (e) => {
     shown = prompt + "\n[files: " + attachments.map((a) => a.path).join(", ") + "]";
   }
   $("#input").value = "";
-  history.push({ role: "user", content, shown });
+  await runChat(content, shown, false);
+};
+
+// Send one prompt to the model and stream the answer into the chat.
+// big = an automation prompt that carries file contents (kept in context only until the next big one).
+async function runChat(content, shown, big) {
+  const model = $("#model").value;
+  if (!model) { toast("No model. Is the tunnel up?"); return; }
+  if (ctrl) { toast("Wait for the current reply or press Stop"); return; }
+  history.push({ role: "user", content, shown, big: !!big });
   addMsg("user", shown);
-  const el = addMsg("assistant", "...");
+  const el = addMsg("assistant", "...", false, true);
   let text = "";
   ctrl = new AbortController();
   setBusy(true);
@@ -892,7 +967,14 @@ $("#composer").onsubmit = async (e) => {
     const pc = await projectContext();
     if (memNotes.length) messages.push({ role: "system", content: "Things to remember about the user and their projects:\n- " + memNotes.join("\n- ") });
     if (pc) messages.push({ role: "system", content: pc });
-    history.filter((m) => !m.local).forEach((m) => messages.push({ role: m.role, content: m.content }));
+    const live = history.filter((m) => !m.local);
+    let lastBig = -1;
+    live.forEach((m, i) => { if (m.big) lastBig = i; });
+    live.forEach((m, i) => {
+      // older automation prompts are replaced by their summary so they do not fill the context window
+      const c = m.big && i !== lastBig ? m.shown + "\n[file contents omitted to save context]" : m.content;
+      messages.push({ role: m.role, content: c });
+    });
     const r = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-PWA": "1" },
@@ -920,7 +1002,7 @@ $("#composer").onsubmit = async (e) => {
         if (j.error) throw new Error(j.error);
         if (j.message && j.message.content) text += j.message.content;
       }
-      renderText(el, text);
+      renderText(el, text, false);
       $("#msgs").scrollTop = $("#msgs").scrollHeight;
     }
   } catch (err) {
@@ -930,15 +1012,268 @@ $("#composer").onsubmit = async (e) => {
     } else {
       text += "\n[stopped]";
     }
-    renderText(el, text);
   } finally {
+    renderText(el, text, true);
     ctrl = null;
     setBusy(false);
     history.push({ role: "assistant", content: text });
     if (history.length > 40) history = history.slice(-40);
-    store.set("hist", history);
+    saveHist();
   }
+}
+
+// ---------- AI development automation ----------
+// Each action asks the server for facts (checks, scans, file text), builds a prompt that fits
+// the context budget, and sends it through the normal chat so you can follow up and Apply files.
+let autoBusy = false;
+const AUTO_LABEL = {
+  analyze: "Analyze project", bugs: "Find and fix bugs", feature: "Build a feature", review: "Review code",
+  tests: "Generate tests", docs: "Write docs", deps: "Check dependencies",
 };
+
+function autoBudget() { return Math.round((Number($("#ctx").value) || 8192) * 1.6); }
+
+function autoRefresh() {
+  $("#aLine").textContent = currentRepo
+    ? currentRepo + " | about " + autoBudget() + " characters of code per request (set by the ctx menu in Chat)"
+    : "Pick a repo in the Repos tab first.";
+}
+
+function fence(c) { return c.includes("```") ? "~~~~" : "```"; }
+function fmtFiles(files) {
+  return files.map((f) => {
+    const f3 = fence(f.content);
+    return "File: " + f.path + (f.truncated ? " (cut: file is longer)" : "") + "\n" + f3 + "\n" + f.content + "\n" + f3;
+  }).join("\n\n");
+}
+
+function checkSummary(j) {
+  const lines = [];
+  if (j.syntax.length) {
+    lines.push("Syntax problems (" + j.syntax.length + "):");
+    j.syntax.slice(0, 30).forEach((x) => lines.push("- " + x.path + (x.line ? ":" + x.line : "") + " " + x.msg));
+  } else {
+    lines.push("Syntax: no problems in " + j.files_checked + " files.");
+  }
+  const t = j.tests;
+  lines.push(t.ran ? "Tests (" + t.cmd + "): " + (t.ok ? "PASSED" : "FAILED") + " in " + t.seconds + " s" : "Tests: none found or not run.");
+  return lines.join("\n");
+}
+
+// Run syntax check and tests, and post the result as a note in the chat.
+async function autoChecks(announce) {
+  const j = await api("/api/check", { repo: currentRepo, run_tests: $("#aRun").checked });
+  let text = "Checks on " + currentRepo + ":\n" + checkSummary(j);
+  if (j.tests.ran && !j.tests.ok) text += "\n\n" + j.tests.output.slice(-1800);
+  if (announce && (j.syntax.length || (j.tests.ran && !j.tests.ok))) text += "\n\nUse Auto > Find and fix bugs to send the failures to the model.";
+  noteMsg(text);
+  return j;
+}
+
+const AUTO = {
+  async analyze(req, step) {
+    step("Scanning project...");
+    const j = await api("/api/analyze?repo=" + enc(currentRepo) + "&budget=" + Math.round(autoBudget() * 0.5));
+    const langs = j.languages.map((l) => l.name + " " + l.files + " files, " + l.loc + " lines").join("; ") || "none detected";
+    step(j.files + " files. " + langs);
+    const content = [
+      "Analyse the repository \"" + j.repo + "\" using only the facts below.",
+      ...(req ? ["Focus: " + req] : []),
+      "", "Facts:",
+      "- " + j.files + " files. Languages: " + langs,
+      "- Manifests: " + (j.manifests.join(", ") || "none"),
+      "- Entry points: " + (j.entry.join(", ") || "none found"),
+      "- Tests: " + (j.has_tests ? j.tests.slice(0, 15).join(", ") : "none found"),
+      "", "Key files:", fmtFiles(j.key_files.map((k) => ({ path: k.path, content: k.head }))),
+      "", "File list:", j.tree + (j.more ? "\n... and " + j.more + " more files" : ""),
+      "", "Answer with these sections: Purpose; Architecture (main modules and how they connect); How to run, build and test; " +
+        "Risks and weak spots (security, error handling, missing tests, missing docs); Top 5 next steps, each naming the file and the change. " +
+        "Do not invent files that are not listed, and say what you could not see.",
+    ].join("\n");
+    return { content, shown: "Analyze project" + (req ? ": " + req : "") + "\n[" + j.files + " files, " + j.languages.length + " languages]" };
+  },
+
+  async bugs(req, step) {
+    const run = $("#aRun").checked;
+    step("Checking syntax" + (run ? " and running tests (up to 3 min)" : "") + "...");
+    const j = await api("/api/check", { repo: currentRepo, run_tests: run });
+    step(checkSummary(j));
+    const t = j.tests;
+    const failing = j.syntax.length > 0 || (t.ran && !t.ok);
+    if (!failing && !req) { step("\nNothing failed. Describe a bug in the box above to investigate it."); return null; }
+    let out = t.ran && !t.ok ? t.output : "";
+    if (out.length > 4000) out = out.slice(0, 1500) + "\n[... cut ...]\n" + out.slice(-2500);
+    const paths = j.syntax.map((x) => x.path);
+    const re1 = /File "([^"]+)"/g;
+    const re2 = /([\w./-]+\.(?:py|js|mjs|ts|jsx|tsx|go|rs|java|rb|php|sh)):\d+/g;
+    let m;
+    while ((m = re1.exec(out)) && paths.length < 30) paths.push(m[1]);
+    while ((m = re2.exec(out)) && paths.length < 30) paths.push(m[1]);
+    step("Reading the files involved...");
+    const b = await api("/api/bundle", { repo: currentRepo, paths: Array.from(new Set(paths)), scope: "query",
+      query: req + " " + out.slice(0, 1500), budget: Math.round(autoBudget() * 0.75) });
+    const content = [
+      "Find and fix the bugs in repo \"" + currentRepo + "\".",
+      ...(req ? ["", "User report: " + req] : []),
+      "", "Automated checks:", checkSummary(j),
+      ...(out ? ["", "Test output:", "```", out, "```"] : []),
+      "", "Relevant files:", fmtFiles(b.files),
+      "", "For each problem: state the root cause in one or two sentences, then give the fix. Show every changed file in full, " +
+        "each preceded by a line \"File: path\" and a fenced block, so it can be applied directly. Change only what is needed. " +
+        "If the checks pass, look for likely bugs in the files shown (logic errors, unhandled edge cases) and cite line numbers. " +
+        "If you need a file that is not shown, name it and stop.",
+    ].join("\n");
+    return { content, shown: "Find and fix bugs" + (req ? ": " + req : "") + "\n[" + j.syntax.length + " syntax problems, tests " +
+      (t.ran ? (t.ok ? "passed" : "failed") : "not run") + ", " + b.files.length + " files read]" };
+  },
+
+  async feature(req, step) {
+    step("Finding the relevant files...");
+    const [ctx, b] = await Promise.all([
+      api("/api/context?repo=" + enc(currentRepo)),
+      api("/api/bundle", { repo: currentRepo, scope: "query", query: req, budget: Math.round(autoBudget() * 0.75) }),
+    ]);
+    step(b.files.length + " files read: " + b.files.map((f) => f.path).join(", "));
+    const content = [
+      "Implement this feature in repo \"" + currentRepo + "\":", req,
+      "", "Project files:", ctx.tree.slice(0, 3000), "",
+      "Existing code that is likely relevant:", fmtFiles(b.files),
+      "", "First give a short plan (3 to 6 bullets: which files change or are created and why). Then give every new or changed file in full, " +
+        "each preceded by a line \"File: path\" and a fenced block with the language. Match the existing style, use only libraries already in the project " +
+        "unless you say otherwise, and do not rewrite unrelated code. End with how to try the feature. " +
+        "If you need a file that is not shown, name it and stop.",
+    ].join("\n");
+    return { content, shown: "Build feature: " + req + "\n[" + b.files.length + " files read]" };
+  },
+
+  async review(req, step) {
+    const scope = $("#aScope").value;
+    step("Scanning " + (scope === "changes" ? "changed files" : "the whole project") + "...");
+    const sc = await api("/api/review_scan?repo=" + enc(currentRepo) + "&scope=" + scope);
+    if (!sc.files) { step("No changed files. Set the scope to whole project."); return null; }
+    const c = sc.counts;
+    step(sc.files + " files. Findings: " + c.high + " high, " + c.medium + " medium, " + c.low + " low");
+    let diff = "";
+    if (scope === "changes") {
+      const d = await api("/api/diff?repo=" + enc(currentRepo));
+      diff = (d.output || "").slice(0, Math.round(autoBudget() * 0.35));
+    }
+    const b = await api("/api/bundle", { repo: currentRepo, scope: scope === "changes" ? "changes" : (req ? "query" : "all"),
+      query: req, budget: Math.round(autoBudget() * (diff ? 0.4 : 0.75)) });
+    const found = sc.findings.slice(0, 40).map((f) => "- [" + f.severity + "] " + f.path + ":" + f.line + " " + f.message + (f.text ? " -> " + f.text : ""));
+    const content = [
+      "Review the code in repo \"" + currentRepo + "\" (" + (scope === "changes" ? "changed files" : "whole project") + ").",
+      ...(req ? ["Focus: " + req] : []),
+      "", "Automated pattern scan (" + c.high + " high, " + c.medium + " medium, " + c.low + " low" + (sc.capped ? ", list capped" : "") + "):",
+      found.join("\n") || "(nothing flagged)",
+      ...(diff ? ["", "Git diff against the last commit (tracked files):", "```diff", diff, "```"] : []),
+      "", "Files:", fmtFiles(b.files),
+      "", "Review like a senior engineer. The scan is a simple pattern matcher: confirm each real finding, dismiss false positives with a reason, " +
+        "and add problems it cannot see (logic bugs, missing validation, error handling, races, performance, readability). " +
+        "For each issue give: severity, file:line, what is wrong, how to fix it. End with the 3 most important fixes. " +
+        "Write corrected files (\"File: path\" plus a fenced block, full contents) only for high severity issues.",
+    ].join("\n");
+    return { content, shown: "Review code (" + (scope === "changes" ? "changes" : "whole project") + ")" + (req ? ": " + req : "") +
+      "\n[scan: " + c.high + " high, " + c.medium + " medium, " + c.low + " low; " + b.files.length + " files read]" };
+  },
+
+  async tests(req, step) {
+    const scope = $("#aScope").value;
+    step("Reading the project...");
+    const a = await api("/api/analyze?repo=" + enc(currentRepo) + "&budget=2000");
+    const b = await api("/api/bundle", { repo: currentRepo, scope: req ? "query" : (scope === "changes" ? "changes" : "all"),
+      query: req, budget: Math.round(autoBudget() * 0.8) });
+    const src = b.files.filter((f) => !a.tests.includes(f.path));
+    if (!src.length) { step("No source files to test in this scope."); return null; }
+    step(src.length + " source files, " + (a.has_tests ? a.tests.length + " existing test files" : "no tests yet"));
+    const content = [
+      "Write tests for repo \"" + currentRepo + "\"." + (req ? " Focus: " + req : ""),
+      "Languages: " + (a.languages.map((l) => l.name).join(", ") || "unknown") + ". Existing tests: " + (a.has_tests ? a.tests.slice(0, 15).join(", ") : "none") + ".",
+      "", "Source files:", fmtFiles(src),
+      ...(b.files.length > src.length ? ["", "Existing tests (keep their style, do not duplicate):", fmtFiles(b.files.filter((f) => a.tests.includes(f.path)))] : []),
+      "", "Use the test framework the project already uses. If there is none, use unittest for Python (standard library) and node:test for JavaScript. " +
+        "Write (1) unit tests: normal, edge and error cases for the public functions; (2) integration tests that exercise several parts together " +
+        "(for example the HTTP API against a temporary folder, or file and git flows). No network and no real model calls: use temporary folders and fakes. " +
+        "Name files tests/test_<module>.py (or <name>.test.js). Do not change the source files; if something cannot be tested as written, say so after the code. " +
+        "Give each test file in full, preceded by \"File: tests/...\" and a fenced block, then the command to run them.",
+    ].join("\n");
+    return { content, shown: "Generate tests" + (req ? ": " + req : "") + " (" + (scope === "changes" && !req ? "changes" : "whole project") + ")\n[" + src.length + " source files read]" };
+  },
+
+  async docs(req, step) {
+    step("Reading the project...");
+    const a = await api("/api/analyze?repo=" + enc(currentRepo) + "&budget=1500");
+    const b = await api("/api/bundle", { repo: currentRepo, paths: ["README.md"], scope: req ? "query" : "all", query: req, budget: autoBudget() });
+    step(b.files.length + " files read" + (b.omitted ? ", " + b.omitted + " skipped (context budget)" : ""));
+    const content = [
+      "Write documentation for repo \"" + currentRepo + "\"." + (req ? " Focus: " + req : ""),
+      "Languages: " + (a.languages.map((l) => l.name).join(", ") || "unknown") + ". Files: " + a.files + ".",
+      "", "Files:", fmtFiles(b.files),
+      "", "Produce two files. (1) README.md: title, what it does, features, requirements, install, usage with commands, configuration and environment variables, " +
+        "project structure, how to test, troubleshooting. (2) docs/TECHNICAL.md: architecture, module by module description, data flow, " +
+        "API or endpoint reference if there is one, extension points, known limitations. " +
+        "Base everything on the files shown and keep the parts of the existing README that are still correct. Where something is unknown write \"TODO: ...\" instead of guessing. " +
+        "Write each file in full, preceded by \"File: path\" and a fenced block. Inside the markdown files use 4-space indented code blocks, never triple backticks, so the file fits inside the fence.",
+    ].join("\n");
+    return { content, shown: "Write docs" + (req ? ": " + req : "") + "\n[" + b.files.length + " files read]" };
+  },
+
+  async deps(req, step) {
+    step("Reading manifests and asking PyPI and npm for the latest versions...");
+    const j = await api("/api/deps?repo=" + enc(currentRepo));
+    if (!j.count) { step("No requirements*.txt, pyproject.toml or package.json found."); return null; }
+    step(j.count + " dependencies, " + j.outdated + " behind" + (j.offline ? " (registries unreachable)" : "") + ", Python " + j.python);
+    j.issues.forEach((i) => step("! " + i));
+    const rows = j.deps.slice(0, 80).map((d) => "- " + d.eco + " " + d.name + " " + (d.spec || "(no constraint)") + (d.dev ? " [dev]" : "") +
+      " in " + d.source + " | latest " + (d.latest || "unknown") + (d.behind ? " (" + d.behind + " behind)" : "") +
+      (d.requires ? " | needs " + d.requires : "") + (d.problem ? " | " + d.problem : "") + (d.error ? " | lookup failed" : ""));
+    const b = await api("/api/bundle", { repo: currentRepo, paths: Array.from(new Set(j.deps.map((d) => d.source))), scope: "paths", budget: 12000 });
+    const content = [
+      "Analyse the dependencies of repo \"" + currentRepo + "\"." + (req ? " Focus: " + req : ""),
+      "Latest versions come from PyPI and npm just now. Python on this device: " + j.python + ".",
+      ...(j.offline ? ["The registries could not be reached, so the latest versions are unknown. Say so."] : []),
+      "", "Dependencies:", rows.join("\n"),
+      ...(j.issues.length ? ["", "Detected issues:", ...j.issues.map((i) => "- " + i)] : []),
+      "", "Manifests:", fmtFiles(b.files),
+      "", "Report: (1) safe to update now (patch and minor); (2) needs care (major): what usually breaks; (3) incompatible or risky: Python or Node version limits, " +
+        "conflicting pins, duplicates, URL installs, unpinned packages with a suggested constraint; (4) packages to drop or replace if you know they are abandoned or deprecated " +
+        "(say \"not sure\" otherwise). You have no vulnerability database here, so do not claim security advisories; recommend pip-audit or npm audit for that. " +
+        "Then give the updated manifest(s) for the safe updates only, in full, preceded by \"File: path\" and a fenced block.",
+    ].join("\n");
+    return { content, shown: "Check dependencies" + (req ? ": " + req : "") + "\n[" + j.count + " dependencies, " + j.outdated + " behind, " + j.issues.length + " issues]" };
+  },
+};
+
+async function autoRun(kind) {
+  if (autoBusy) return;
+  if (!currentRepo) { toast("Pick a repo in the Repos tab first"); return; }
+  if (ctrl) { toast("Wait for the current chat reply or press Stop"); return; }
+  if (!$("#model").value) { toast("No model. Is the tunnel up?"); return; }
+  const req = $("#aReq").value.trim();
+  if (kind === "feature" && !req) { toast("Describe the feature first"); $("#aReq").focus(); return; }
+  if (kind === "bugs" && $("#aRun").checked &&
+      !window.confirm("Running tests executes this project's code on your phone. Continue?\nUntick 'run tests' to only check syntax.")) return;
+  autoBusy = true;
+  const btns = document.querySelectorAll("#aBtns button");
+  btns.forEach((b) => { b.disabled = true; });
+  const out = $("#aOut");
+  out.textContent = AUTO_LABEL[kind] + "...\n";
+  const step = (t) => { out.textContent += t + "\n"; };
+  try {
+    const built = await AUTO[kind](req, step);
+    if (built) {
+      step("\nSending to the model. The reply appears in the Chat tab.");
+      showTab("chat");
+      await runChat(built.content, built.shown, true);
+    }
+  } catch (e) {
+    step("Error: " + e.message);
+  } finally {
+    autoBusy = false;
+    btns.forEach((b) => { b.disabled = false; });
+  }
+}
+document.querySelectorAll("#aBtns [data-a]").forEach((b) => { b.onclick = () => autoRun(b.dataset.a); });
 
 // ---------- start ----------
 drawHistory();

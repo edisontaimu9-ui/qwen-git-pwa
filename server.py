@@ -755,6 +755,662 @@ def r_switch(h, q):
     h.send_json(200, res)
 
 
+# ---------- AI development automation (server side tools) ----------
+# These gather facts the model cannot see by itself: project layout, check and
+# test results, static findings, dependency versions and relevant file text.
+# The model call itself stays in the browser (same /api/chat proxy as the chat).
+import ast
+import concurrent.futures
+import shutil
+import time
+import urllib.request
+
+SKIP_DIRS = {"node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next", "vendor", ".tox"}
+TEXT_SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".woff",
+                 ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".webm", ".so", ".pyc", ".class", ".jar", ".apk", ".lock"}
+LANGS = {".py": "Python", ".js": "JavaScript", ".mjs": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript",
+         ".jsx": "JavaScript", ".html": "HTML", ".css": "CSS", ".json": "JSON", ".sh": "Shell", ".md": "Markdown",
+         ".go": "Go", ".rs": "Rust", ".java": "Java", ".c": "C", ".cpp": "C++", ".rb": "Ruby", ".php": "PHP",
+         ".yml": "YAML", ".yaml": "YAML", ".toml": "TOML", ".sql": "SQL"}
+MANIFESTS = {"package.json", "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile", "Cargo.toml",
+             "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json", "Makefile", "Dockerfile", "start.sh"}
+STOP = set("the and for with that this from into make add fix new use using create when where what should would "
+           "could have has are was not but can will all any file files code function feature bug".split())
+
+
+def repo_files(root, limit=3000):
+    """Text-like files git knows about (tracked + untracked, not ignored)."""
+    out = git_bytes(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root)
+    names = []
+    for t in out.split(b"\0"):
+        if not t:
+            continue
+        try:
+            n = t.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        parts = n.split("/")
+        if any(p in SKIP_DIRS for p in parts[:-1]) or Path(n).suffix.lower() in TEXT_SKIP_EXT:
+            continue
+        if n.endswith((".min.js", ".min.css", "package-lock.json")):
+            continue
+        fp = root / n
+        try:
+            if fp.is_symlink() or not fp.is_file():
+                continue
+        except OSError:
+            continue
+        names.append(n)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def read_text(root, rel, cap=MAX_FILE):
+    """Decoded text of a repo file, or None when it is binary, huge or unsafe."""
+    try:
+        p = safe_join(root, rel)
+        if p.is_symlink() or not p.is_file() or p.stat().st_size > cap:
+            return None
+        data = p.read_bytes()
+    except (ApiError, OSError):
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def clamp_budget(v, default=24000):
+    try:
+        return max(2000, min(120000, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+# 1. Project analysis -------------------------------------------------------
+
+def r_analyze(h, q):
+    root = repo_path(q.get("repo"))
+    budget = clamp_budget(q.get("budget"), 12000)
+    names = repo_files(root)
+    langs, loc = {}, {}
+    for n in names:
+        lang = LANGS.get(Path(n).suffix.lower())
+        if not lang:
+            continue
+        t = read_text(root, n, 1_000_000)
+        if t is None:
+            continue
+        langs[lang] = langs.get(lang, 0) + 1
+        loc[lang] = loc.get(lang, 0) + t.count("\n") + 1
+    manifests = [n for n in names if Path(n).name in MANIFESTS and n.count("/") <= 1]
+    entry = [n for n in names if Path(n).name in ("main.py", "app.py", "server.py", "index.js", "app.js", "index.html",
+                                                  "main.js", "cli.py", "__main__.py", "manage.py") and n.count("/") <= 2]
+    tests = [n for n in names if re.search(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*\.py$|_test\.py$|\.(test|spec)\.[jt]sx?$", n)]
+    readme = next((n for n in names if n.lower() in ("readme.md", "readme.txt", "readme")), "")
+    parts = []
+    used = 0
+
+    def add(path, cap):
+        nonlocal used
+        t = read_text(root, path)
+        if t is None or used >= budget:
+            return
+        t = t[:min(cap, budget - used)]
+        used += len(t)
+        parts.append({"path": path, "head": t})
+
+    if readme:
+        add(readme, 2500)
+    for n in manifests[:6]:
+        add(n, 1500)
+    for n in entry[:4]:
+        add(n, 2500)
+    h.send_json(200, {
+        "repo": root.name,
+        "files": len(names),
+        "languages": sorted(({"name": k, "files": langs[k], "loc": loc[k]} for k in langs),
+                            key=lambda x: -x["loc"]),
+        "manifests": manifests, "entry": entry, "tests": tests[:40], "has_tests": bool(tests),
+        "tree": "\n".join(names[:250]), "more": max(0, len(names) - 250),
+        "key_files": parts,
+    })
+
+
+# 2. Bug finding: syntax check + tests ---------------------------------------
+
+def syntax_problems(root, names):
+    found = []
+    node = shutil.which("node")
+    js_checked = 0
+    for n in names:
+        ext = Path(n).suffix.lower()
+        if ext == ".py":
+            t = read_text(root, n, 1_000_000)
+            if t is None:
+                continue
+            try:
+                compile(t, n, "exec", dont_inherit=True)  # compile only, never runs the code
+            except SyntaxError as e:
+                found.append({"path": n, "line": e.lineno or 0, "msg": "SyntaxError: %s" % e.msg})
+            except (ValueError, RecursionError, MemoryError) as e:
+                found.append({"path": n, "line": 0, "msg": "cannot compile: %s" % e})
+        elif ext == ".json":
+            t = read_text(root, n, 1_000_000)
+            if t is None:
+                continue
+            try:
+                json.loads(t)
+            except ValueError as e:
+                found.append({"path": n, "line": getattr(e, "lineno", 0), "msg": "Invalid JSON: %s" % e})
+        elif ext in (".js", ".mjs") and node and js_checked < 60:
+            js_checked += 1
+            try:
+                p = subprocess.run([node, "--check", str(root / n)], capture_output=True, text=True,
+                                   errors="replace", timeout=20)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+            if p.returncode != 0:
+                err = p.stderr.strip().splitlines()
+                m = re.search(r":(\d+)\s*$", err[0]) if err else None
+                msg = next((ln for ln in err if "Error" in ln), err[-1] if err else "syntax error")
+                found.append({"path": n, "line": int(m.group(1)) if m else 0, "msg": msg[:200]})
+    return found
+
+
+def pick_test_command(root, names):
+    """Return (command, extra_env) for the project's tests, or None."""
+    py_tests = [n for n in names if re.search(r"(^|/)tests?/.*\.py$|(^|/)test_[^/]*\.py$|_test\.py$", n)]
+    pj = root / "package.json"
+    if pj.is_file():
+        try:
+            scripts = json.loads(pj.read_text(encoding="utf-8")).get("scripts", {})
+        except (OSError, ValueError, AttributeError):
+            scripts = {}
+        if isinstance(scripts, dict) and scripts.get("test") and shutil.which("npm") and (root / "node_modules").is_dir():
+            return ["npm", "test", "--silent"], {}
+    if py_tests:
+        py = shutil.which("python3") or sys.executable
+        path = os.pathsep.join(str(x) for x in (root, root / "src") if x.exists())
+        env = {"PYTHONPATH": path}
+        probe = subprocess.run([py, "-c", "import pytest"], capture_output=True, timeout=20)
+        if probe.returncode == 0:
+            return [py, "-m", "pytest", "-x", "-q", "--no-header", "-p", "no:cacheprovider"], env
+        start = "tests" if (root / "tests").is_dir() else ("test" if (root / "test").is_dir() else ".")
+        pat = "test_*.py" if any(Path(n).name.startswith("test_") for n in py_tests) else "*_test.py"
+        return [py, "-m", "unittest", "discover", "-s", start, "-p", pat, "-v"], env
+    return None
+
+
+def r_check(h, q):
+    """POST: syntax check every source file and run the project's tests (runs repo code)."""
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    names = repo_files(root)
+    syntax = syntax_problems(root, names)
+    res = {"syntax": syntax, "files_checked": len(names), "tests": {"ran": False}}
+    if d.get("run_tests", True):
+        picked = pick_test_command(root, names)
+        if picked:
+            cmd, extra = picked
+            env = dict(os.environ, CI="1", PYTHONDONTWRITEBYTECODE="1", LC_ALL="C", **extra)
+            t0 = time.time()
+            try:
+                p = subprocess.run(cmd, cwd=str(root), env=env, capture_output=True, text=True,
+                                   errors="replace", timeout=180, stdin=subprocess.DEVNULL)
+                out = p.stdout + p.stderr
+                ok = p.returncode == 0
+            except subprocess.TimeoutExpired:
+                out, ok = "Tests timed out after 180 s.", False
+            except OSError as e:
+                out, ok = "Could not run tests: %s" % e, False
+            if len(out) > MAX_OUT:
+                out = out[:MAX_OUT // 2] + "\n[... truncated ...]\n" + out[-MAX_OUT // 2:]
+            res["tests"] = {"ran": True, "cmd": " ".join(cmd[1:] if cmd[0] != "npm" else cmd), "ok": ok,
+                            "seconds": round(time.time() - t0, 1), "output": out}
+    h.send_json(200, res)
+
+
+# 3. Feature development / tests / docs: choose the files the model needs ----
+
+def rank_files(root, names, query):
+    words = {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", (query or "").lower()) if w not in STOP}
+    scored = []
+    for n in names:
+        s = 0
+        low = n.lower()
+        for w in words:
+            if w in low:
+                s += 5
+        t = read_text(root, n, 120_000) if words else None
+        if t:
+            tl = t.lower()
+            for w in words:
+                s += min(tl.count(w), 6)
+        if Path(n).name in ("README.md", "package.json", "requirements.txt", "pyproject.toml"):
+            s += 1
+        if s:
+            scored.append((s, n))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [n for _, n in scored]
+
+
+def r_bundle(h, q):
+    """POST: return file text for the task, chosen by explicit paths, changes, or a keyword query."""
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    budget = clamp_budget(d.get("budget"))
+    names = repo_files(root)
+    known = set(names)
+    chosen = []
+    paths = d.get("paths")
+    if isinstance(paths, list) and paths:
+        prefix = str(root) + "/"
+        rel = []
+        for x in paths[:200]:
+            if isinstance(x, str):
+                x = x[len(prefix):] if x.startswith(prefix) else (x[2:] if x.startswith("./") else x)
+                if x and not x.startswith("/") and ".." not in x.split("/") and "\x00" not in x:
+                    rel.append(x)
+        for p in rel:
+            if p in known and p not in chosen:
+                chosen.append(p)
+    scope = d.get("scope", "query")
+    if scope == "changes":
+        chg = parse_status(root)
+        chosen += [p for p in sorted(chg) if p in known and p not in chosen]
+    if scope in ("query", "changes") and len(chosen) < 12:
+        chosen += [p for p in rank_files(root, names, str(d.get("query", ""))[:2000]) if p not in chosen][:12 - len(chosen)]
+    if scope == "all" or (not chosen and scope != "paths"):
+        pri = sorted(names, key=lambda n: (n.count("/"), n))
+        chosen += [p for p in pri if p not in chosen]
+    out, used, omitted = [], 0, 0
+    for p in chosen:
+        t = read_text(root, p)
+        if t is None:
+            continue
+        if used >= budget:
+            omitted += 1
+            continue
+        room = budget - used
+        trunc = len(t) > room
+        if trunc:
+            t = t[:room]
+        used += len(t)
+        out.append({"path": p, "content": t, "truncated": trunc})
+    h.send_json(200, {"files": out, "omitted": omitted, "chars": used})
+
+
+def r_apply(h, q):
+    """POST: write several files at once (all paths are validated before anything is written)."""
+    d = h.read_json()
+    root = repo_path(d.get("repo"))
+    files = d.get("files")
+    if not isinstance(files, list) or not files or len(files) > 40:
+        raise ApiError(400, "1 to 40 files required")
+    plan = []
+    for f in files:
+        if not isinstance(f, dict) or not isinstance(f.get("path"), str) or not isinstance(f.get("content"), str):
+            raise ApiError(400, "each file needs path and content")
+        if len(f["content"]) > 1_000_000:
+            raise ApiError(400, "file too large: " + f["path"])
+        rel = f["path"].strip()
+        clean_paths([rel])
+        p = safe_join(root, rel)
+        if p.is_dir():
+            raise ApiError(400, "path is a directory: " + rel)
+        plan.append((rel, p, f["content"]))
+    lines = []
+    for rel, p, content in plan:
+        existed = p.exists()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        lines.append(("updated " if existed else "created ") + rel)
+    h.send_json(200, {"ok": True, "output": "\n".join(lines), "count": len(lines)})
+
+
+# 4. Code review: static scan -------------------------------------------------
+
+SCAN_RULES = [
+    # (id, severity, languages or None, regex, message)
+    ("secret-key", "high", None, r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----", "private key committed"),
+    ("secret-aws", "high", None, r"\bAKIA[0-9A-Z]{16}\b", "AWS access key id"),
+    ("secret-gh", "high", None, r"\bgh[pousr]_[A-Za-z0-9]{30,}\b", "GitHub token"),
+    ("secret-assign", "high", None,
+     r"(?i)\b(?:api[_-]?key|secret|passwd|password|token|auth)\w*\s*[:=]\s*[\"'][^\"'\s]{8,}[\"']",
+     "hard-coded credential"),
+    ("py-eval", "high", {".py"}, r"(?<![\w.])eval\s*\(", "eval() runs arbitrary code"),
+    ("py-exec", "high", {".py"}, r"(?<![\w.])exec\s*\(", "exec() runs arbitrary code"),
+    ("py-shell", "high", {".py"}, r"shell\s*=\s*True", "subprocess with shell=True allows command injection"),
+    ("py-ossystem", "medium", {".py"}, r"\bos\.(?:system|popen)\s*\(", "os.system/popen builds shell commands"),
+    ("py-pickle", "high", {".py"}, r"\bpickle\.loads?\s*\(", "pickle can execute code when loading untrusted data"),
+    ("py-yaml", "medium", {".py"}, r"\byaml\.load\s*\((?![^)]*Loader)", "yaml.load without a safe Loader"),
+    ("py-verify", "high", {".py"}, r"verify\s*=\s*False", "TLS certificate verification disabled"),
+    ("py-weakhash", "medium", {".py"}, r"\bhashlib\.(?:md5|sha1)\s*\(", "weak hash (fine for checksums, not security)"),
+    ("py-mktemp", "medium", {".py"}, r"\btempfile\.mktemp\s*\(", "mktemp is race-prone, use mkstemp"),
+    ("py-bind", "medium", {".py"}, r"[\"']0\.0\.0\.0[\"']", "binds to all network interfaces"),
+    ("py-sqlfmt", "high", {".py"}, r"\.execute\s*\(\s*(?:f[\"']|[\"'][^\"']*[\"']\s*(?:%|\.format|\+))",
+     "SQL built from strings, use parameters"),
+    ("js-eval", "high", {".js", ".mjs", ".ts", ".jsx", ".tsx"}, r"(?<![\w.])eval\s*\(|new\s+Function\s*\(", "eval/new Function runs strings as code"),
+    ("js-innerhtml", "medium", {".js", ".mjs", ".ts", ".jsx", ".tsx", ".html"}, r"\.innerHTML\s*[+]?=|document\.write\s*\(|dangerouslySetInnerHTML",
+     "HTML injection risk (XSS) if the text is not trusted"),
+    ("js-exec", "high", {".js", ".mjs", ".ts"}, r"child_process|\bexecSync\s*\(", "spawns shell commands"),
+    ("js-localstorage-secret", "medium", {".js", ".mjs", ".ts", ".jsx", ".tsx"},
+     r"localStorage\.setItem\([^)]*(?i:token|password|secret)", "secret stored in localStorage"),
+    ("sh-curlpipe", "high", {".sh"}, r"curl[^|\n]*\|\s*(?:sudo\s+)?(?:ba)?sh", "pipes a download straight into a shell"),
+    ("sh-unquoted-rm", "medium", {".sh"}, r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+\$\w+", "rm -r on an unquoted variable"),
+    ("todo", "low", None, r"\b(?:TODO|FIXME|HACK|XXX)\b", "unfinished work marker"),
+]
+SCAN_COMPILED = [(i, s, l, re.compile(rx), m) for i, s, l, rx, m in SCAN_RULES]
+SEV_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def py_quality(path, text):
+    """Quality findings from the AST: long functions, bare except, mutable defaults, many arguments."""
+    res = []
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return res
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n = (node.end_lineno or node.lineno) - node.lineno + 1
+            if n > 80:
+                res.append((node.lineno, "medium", "long-function", "%s() is %d lines, consider splitting it" % (node.name, n)))
+            a = node.args
+            if len(a.args) + len(a.kwonlyargs) > 7:
+                res.append((node.lineno, "low", "many-args", "%s() takes %d arguments" % (node.name, len(a.args) + len(a.kwonlyargs))))
+            for dflt in list(a.defaults) + [x for x in a.kw_defaults if x is not None]:
+                if isinstance(dflt, (ast.List, ast.Dict, ast.Set)):
+                    res.append((dflt.lineno, "medium", "mutable-default", "mutable default argument in %s()" % node.name))
+        elif isinstance(node, ast.ExceptHandler):
+            if node.type is None:
+                res.append((node.lineno, "medium", "bare-except", "bare except hides real errors and catches KeyboardInterrupt"))
+            elif (isinstance(node.type, ast.Name) and node.type.id == "Exception" and len(node.body) == 1
+                  and isinstance(node.body[0], ast.Pass)):
+                res.append((node.lineno, "medium", "swallowed-error", "exception caught and ignored with pass"))
+    return res
+
+
+def scan_text(path, text):
+    ext = Path(path).suffix.lower()
+    found = []
+    for i, line in enumerate(text.split("\n"), 1):
+        if len(line) > 2000 or "batacode: ignore" in line or "nosec" in line:
+            continue
+        for rid, sev, langs, rx, msg in SCAN_COMPILED:
+            if langs is not None and ext not in langs:
+                continue
+            if rx.search(line):
+                found.append({"path": path, "line": i, "severity": sev, "rule": rid, "message": msg,
+                              "text": line.strip()[:160]})
+    if ext == ".py":
+        for line, sev, rid, msg in py_quality(path, text):
+            found.append({"path": path, "line": line, "severity": sev, "rule": rid, "message": msg, "text": ""})
+    if text.count("\n") > 1000 and ext in LANGS:
+        found.append({"path": path, "line": 1, "severity": "low", "rule": "big-file",
+                      "message": "file has %d lines, consider splitting it" % (text.count("\n") + 1), "text": ""})
+    return found
+
+
+def r_review_scan(h, q):
+    root = repo_path(q.get("repo"))
+    names = repo_files(root)
+    scope = q.get("scope", "changes")
+    if scope == "changes":
+        chg = parse_status(root)
+        names = [n for n in names if n in chg]
+    findings = []
+    for n in names:
+        t = read_text(root, n, 500_000)
+        if t is not None:
+            findings += scan_text(n, t)
+    findings.sort(key=lambda f: (SEV_ORDER[f["severity"]], f["path"], f["line"]))
+    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEV_ORDER}
+    h.send_json(200, {"scope": scope, "files": len(names), "counts": counts,
+                      "findings": findings[:200], "capped": len(findings) > 200})
+
+
+# 5. Dependency analysis -----------------------------------------------------
+
+PY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+NPM_NAME_RE = re.compile(r"^(?:@[a-z0-9~][a-z0-9._~-]*/)?[a-z0-9~][a-z0-9._~-]*$")
+VER_RE = re.compile(r"\d+(?:\.\d+)*")
+_latest_cache = {}
+
+
+def vtuple(s):
+    m = VER_RE.search(s or "")
+    return tuple(int(x) for x in m.group(0).split(".")[:4]) if m else ()
+
+
+def parse_requirement(line):
+    line = line.split("#", 1)[0].split(";", 1)[0].strip()
+    if not line or line.startswith(("-", "git+", "http", ".", "/")):
+        return None
+    m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(.*)$", line)
+    if not m:
+        return None
+    return m.group(1), m.group(2).strip()
+
+
+def spec_kind(spec):
+    if not spec:
+        return "unpinned"
+    if spec.startswith("==") and "*" not in spec:
+        return "pinned"
+    return "range"
+
+
+def collect_deps(root):
+    deps = []  # dicts: ecosystem, name, spec, source, dev
+    for rel in repo_files(root):
+        base = Path(rel).name
+        if rel.count("/") > 2:
+            continue
+        text = read_text(root, rel, 500_000)
+        if text is None:
+            continue
+        if re.match(r"^requirements[\w.-]*\.txt$", base):
+            for ln in text.splitlines():
+                r = parse_requirement(ln)
+                if r:
+                    deps.append({"eco": "pypi", "name": r[0], "spec": r[1], "source": rel,
+                                 "dev": "dev" in base or "test" in base})
+        elif base == "pyproject.toml":
+            try:
+                import tomllib
+                data = tomllib.loads(text)
+            except Exception:  # missing module (Python < 3.11) or bad file
+                continue
+            proj = data.get("project", {})
+            for ln in proj.get("dependencies", []) or []:
+                r = parse_requirement(str(ln))
+                if r:
+                    deps.append({"eco": "pypi", "name": r[0], "spec": r[1], "source": rel, "dev": False})
+            for grp in (proj.get("optional-dependencies", {}) or {}).values():
+                for ln in grp or []:
+                    r = parse_requirement(str(ln))
+                    if r:
+                        deps.append({"eco": "pypi", "name": r[0], "spec": r[1], "source": rel, "dev": True})
+            for name, spec in ((data.get("tool", {}).get("poetry", {}) or {}).get("dependencies", {}) or {}).items():
+                if name.lower() != "python":
+                    s = spec if isinstance(spec, str) else (spec.get("version", "") if isinstance(spec, dict) else "")
+                    if s[:1] in ("^", "~"):
+                        s = ">=" + s[1:]
+                    deps.append({"eco": "pypi", "name": name, "spec": s, "source": rel, "dev": False})
+        elif base == "package.json":
+            try:
+                data = json.loads(text)
+            except ValueError:
+                continue
+            for key, dev in (("dependencies", False), ("devDependencies", True), ("peerDependencies", False)):
+                block = data.get(key, {})
+                if isinstance(block, dict):
+                    for name, spec in block.items():
+                        deps.append({"eco": "npm", "name": name, "spec": str(spec), "source": rel, "dev": dev})
+    seen, uniq = set(), []
+    for dep in deps:
+        k = (dep["eco"], dep["name"].lower(), dep["spec"], dep["source"], dep["dev"])
+        if k not in seen:
+            seen.add(k)
+            uniq.append(dep)
+    return uniq[:120]
+
+
+def fetch_json(url, first_key=None):
+    """GET a small JSON document. With first_key, only that top-level object is parsed
+    (PyPI puts "info" first and the rest of the document can be several MB)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "batacode-deps/1.0", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:  # nosec - only pypi.org / registry.npmjs.org
+        if not first_key:
+            return json.loads(r.read(2_000_000))
+        buf, limit = b"", 4_000_000
+        dec = json.JSONDecoder()
+        while len(buf) < limit:
+            chunk = r.read(131072)
+            if not chunk:
+                break
+            buf += chunk
+            text = buf.decode("utf-8", "ignore")
+            i = text.find('"%s":' % first_key)
+            if i >= 0:
+                try:
+                    return dec.raw_decode(text[i + len(first_key) + 3:].lstrip())[0]
+                except ValueError:
+                    continue  # object not complete yet, read more
+        raise ValueError("unexpected response")
+
+
+def latest_info(eco, name):
+    key = (eco, name.lower())
+    hit = _latest_cache.get(key)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    info = {"latest": "", "requires": "", "error": ""}
+    try:
+        if eco == "pypi":
+            if not PY_NAME_RE.match(name):
+                raise ValueError("bad name")
+            j = fetch_json("https://pypi.org/pypi/%s/json" % name, "info")
+            info["latest"] = j.get("version") or ""
+            info["requires"] = j.get("requires_python") or ""
+        else:
+            if not NPM_NAME_RE.match(name):
+                raise ValueError("bad name")
+            j = fetch_json("https://registry.npmjs.org/%s/latest" % name.replace("/", "%2f"))
+            info["latest"] = j.get("version") or ""
+            eng = j.get("engines")
+            info["requires"] = ("node " + eng["node"]) if isinstance(eng, dict) and eng.get("node") else ""
+    except Exception as e:  # network or registry problem: report, do not fail the whole scan
+        info["error"] = (type(e).__name__ + ": " + str(e))[:80]
+    if not info["error"]:
+        _latest_cache[key] = (time.time(), info)
+    return info
+
+
+def spec_allows(spec, ver):
+    """Does a version spec (PEP 440 or npm style) accept ver (a tuple)? Unknown syntax counts as yes."""
+    spec = (spec or "").strip()
+    if not spec or spec in ("*", "latest"):
+        return True
+    ok = True
+    for part in re.split(r"[,\s]+(?=[<>=!~^])|,", spec):
+        part = part.strip()
+        m = re.match(r"^(>=|<=|==|!=|~=|>|<|\^|~)?\s*v?(\d+(?:\.\d+)*)(\.[*x])?", part)
+        if not m:
+            continue
+        op, want = m.group(1) or "==", tuple(int(x) for x in m.group(2).split("."))
+        wild = bool(m.group(3))
+        have = ver[:len(want)]
+        if op == "==" and wild:
+            res = ver[:len(want)] == want
+        elif op == "==":
+            res = ver[:len(want)] == want
+        elif op == "!=":
+            res = have != want
+        elif op == ">=":
+            res = ver >= want
+        elif op == ">":
+            res = ver > want
+        elif op == "<=":
+            res = have <= want
+        elif op == "<":
+            res = ver < want
+        elif op == "~=":      # compatible release: ~=2.2 -> 2.*, ~=2.2.1 -> 2.2.*
+            keep = max(1, len(want) - 1)
+            res = ver >= want and ver[:keep] == want[:keep]
+        elif op == "^":       # npm caret: first non-zero part must match
+            nz = next((i for i, x in enumerate(want) if x), len(want) - 1)
+            res = ver >= want and ver[:nz + 1] == want[:nz + 1]
+        else:                 # npm tilde: minor must match
+            keep = 2 if len(want) >= 2 else 1
+            res = ver >= want and ver[:keep] == want[:keep]
+        ok = ok and res
+    return ok
+
+
+def python_allows(spec, ver):
+    return spec_allows(spec, ver)
+
+
+def r_deps(h, q):
+    root = repo_path(q.get("repo"))
+    deps = collect_deps(root)
+    pyver = sys.version_info[:3]
+    pairs = {(d["eco"], d["name"]) for d in deps}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        looked = dict(zip(pairs, ex.map(lambda k: latest_info(*k), pairs))) if pairs else {}
+    rows, issues = [], []
+    pins = {}
+    for d in deps:
+        info = looked.get((d["eco"], d["name"]), {"latest": "", "requires": "", "error": ""})
+        declared = vtuple(d["spec"])
+        latest = vtuple(info["latest"])
+        kind = spec_kind(d["spec"]) if d["eco"] == "pypi" else ("pinned" if re.match(r"^\d", d["spec"]) else
+                                                                 ("unpinned" if d["spec"] in ("", "*", "latest") else "range"))
+        behind = ""
+        allows = spec_allows(d["spec"], latest) if latest and d["spec"] and kind != "unpinned" else True
+        if declared and latest and (kind == "pinned" or not allows):
+            if latest[0] > declared[0]:
+                behind = "major"
+            elif latest[:2] > declared[:2]:
+                behind = "minor"
+            elif latest > declared:
+                behind = "patch"
+        problem = []
+        if kind == "unpinned":
+            problem.append("no version constraint")
+        if behind == "major":
+            problem.append("a new major version exists, check the changelog for breaking changes")
+        elif not allows and kind != "pinned":
+            problem.append("latest %s is outside the allowed range %s" % (info["latest"], d["spec"]))
+        if d["eco"] == "pypi" and info["requires"] and not python_allows(info["requires"], pyver):
+            problem.append("latest release needs Python %s, this device runs %d.%d" % (info["requires"], pyver[0], pyver[1]))
+        if re.search(r"^(?:git\+|https?:|file:|github:)", d["spec"] or ""):
+            problem.append("installed from a URL, not a registry version")
+        rows.append({"eco": d["eco"], "name": d["name"], "spec": d["spec"], "source": d["source"], "dev": d["dev"],
+                     "kind": kind, "latest": info["latest"], "behind": behind, "requires": info["requires"],
+                     "problem": "; ".join(problem), "error": info["error"]})
+        if d["eco"] == "pypi" and kind == "pinned":
+            pins.setdefault(d["name"].lower().replace("_", "-"), set()).add(d["spec"])
+    for name, specs in pins.items():
+        if len(specs) > 1:
+            issues.append("%s is pinned to different versions: %s" % (name, ", ".join(sorted(specs))))
+    both = {d["name"] for d in deps if d["eco"] == "npm" and not d["dev"]} & {d["name"] for d in deps if d["eco"] == "npm" and d["dev"]}
+    for name in sorted(both):
+        issues.append("%s is listed as both a dependency and a devDependency" % name)
+    h.send_json(200, {
+        "python": "%d.%d.%d" % pyver, "count": len(rows), "deps": rows, "issues": issues,
+        "offline": bool(rows) and all(r["error"] for r in rows),
+        "outdated": sum(1 for r in rows if r["behind"]),
+    })
+
+
+
 ROUTES = {
     ("GET", "/api/memory"): r_memory_get,
     ("POST", "/api/memory"): r_memory_post,
@@ -786,6 +1442,12 @@ ROUTES = {
     ("POST", "/api/revert"): r_revert,
     ("POST", "/api/switch"): r_switch,
     ("POST", "/api/upload"): r_upload,
+    ("GET", "/api/analyze"): r_analyze,
+    ("POST", "/api/check"): r_check,
+    ("POST", "/api/bundle"): r_bundle,
+    ("POST", "/api/apply"): r_apply,
+    ("GET", "/api/review_scan"): r_review_scan,
+    ("GET", "/api/deps"): r_deps,
 }
 
 

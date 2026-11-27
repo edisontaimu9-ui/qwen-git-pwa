@@ -1,4 +1,4 @@
-const CACHE = "batacode-v5";
+const CACHE = "batacode-v6";
 const SHELL = ["/", "/app.js", "/style.css", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (e) => {

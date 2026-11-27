@@ -73,3 +73,11 @@ header { flex-wrap: wrap; gap: 4px; }
 .badge { font: 12px ui-monospace, monospace; width: 18px; text-align: center; flex: 0 0 auto; }
 .bM { color: #e5c07b; } .bA, .bQ { color: #6bd68a; } .bD { color: #ff7a7a; } .bR, .bC { color: #7fb2ff; } .bU { color: #ff9a9a; }
 .dl-add { color: #6bd68a; } .dl-del { color: #ff7a7a; } .dl-hunk { color: #7fb2ff; } .dl-meta { color: #8b93a7; }
+#auto { overflow-y: auto; }
+#aReq { resize: vertical; min-height: 70px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.grid button { text-align: left; padding: 10px; font-weight: 600; line-height: 1.25; }
+.grid button small { display: block; font-weight: 400; font-size: 11px; opacity: .75; margin-top: 2px; }
+#aOut { flex: 1 0 120px; margin: 0; padding: 8px; overflow: auto; background: #0a0c11; border-radius: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.applybar { margin: 6px 0; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.applybar button { background: #1f6b3a; border-color: #2c8f4f; }
